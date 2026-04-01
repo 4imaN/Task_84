@@ -75,6 +75,8 @@ run_web() {
 
 run_e2e() {
   ensure_host_deps
+  echo "[run_tests] Ensuring Playwright Chromium is installed..."
+  npx playwright install chromium
   echo "[run_tests] Starting docker stack for E2E..."
   ensure_app_image
   docker compose up -d postgres app
