@@ -1,0 +1,129 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html.dark {
+  color-scheme: dark;
+}
+
+body {
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top left, rgba(141, 91, 45, 0.12), transparent 32%),
+    linear-gradient(180deg, #f7f1e6 0%, #f1ebdc 100%);
+  font-family: Georgia, "Times New Roman", serif;
+}
+
+html.dark body {
+  background:
+    radial-gradient(circle at top left, rgba(141, 91, 45, 0.18), transparent 28%),
+    linear-gradient(180deg, #10120f 0%, #1c1b17 100%);
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.shell-panel {
+  @apply rounded-3xl border border-black/10 bg-white/75 shadow-[0_22px_70px_-45px_rgba(0,0,0,0.55)] backdrop-blur;
+}
+
+html.dark .shell-panel {
+  @apply border-white/10 bg-black/20 text-slate-100;
+}
+
+.nav-link {
+  @apply rounded-full px-4 py-2 text-sm font-medium text-black/65 transition hover:bg-black/5 hover:text-black;
+}
+
+html.dark .nav-link {
+  @apply text-white/70 hover:bg-white/10 hover:text-white;
+}
+
+.nav-link-active {
+  @apply bg-black text-white;
+}
+
+html.dark .nav-link-active {
+  @apply bg-white text-black;
+}
+
+.field {
+  @apply w-full rounded-2xl border border-black/10 bg-white/80 px-4 py-3 text-sm outline-none transition focus:border-brass focus:ring-2 focus:ring-brass/20;
+}
+
+html.dark .field {
+  @apply border-white/10 bg-white/5 text-white placeholder:text-white/35;
+}
+
+.button-primary {
+  @apply rounded-full bg-ink px-5 py-3 text-sm font-semibold text-white transition hover:-translate-y-0.5 hover:bg-pine;
+}
+
+.button-secondary {
+  @apply rounded-full border border-black/10 bg-white/80 px-5 py-3 text-sm font-semibold text-black transition hover:-translate-y-0.5 hover:border-black/25;
+}
+
+html.dark .button-secondary {
+  @apply border-white/10 bg-white/5 text-white hover:border-white/25;
+}
+
+.pos-action-button {
+  @apply inline-flex min-h-[46px] min-w-[136px] items-center justify-center self-start whitespace-nowrap;
+}
+
+.pos-icon-button {
+  @apply inline-flex h-11 w-11 items-center justify-center px-0 text-xl leading-none;
+}
+
+.pos-inline-button {
+  @apply inline-flex min-h-[44px] min-w-[112px] items-center justify-center whitespace-nowrap;
+}
+
+.pos-checkout-button {
+  @apply inline-flex min-h-[46px] w-full max-w-[280px] items-center justify-center self-start md:min-w-[220px];
+}
+
+.pos-cart-quantity-field {
+  @apply h-11 w-full text-center md:max-w-[108px];
+}
+
+.pos-line-quantity-field {
+  @apply h-11 w-[88px] min-w-[88px] max-w-[88px] px-3 text-center;
+}
+
+.button-chip {
+  @apply rounded-full border border-black/10 bg-white/70 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-black/60 transition hover:border-black/25 hover:bg-black/5 hover:text-black;
+}
+
+html.dark .button-chip {
+  @apply border-white/10 bg-white/5 text-white/70 hover:border-white/25 hover:bg-white/10 hover:text-white;
+}
+
+.theme-toggle {
+  @apply inline-flex items-center gap-2 rounded-full border border-black/10 bg-white/80 px-4 py-2 text-sm font-semibold text-black transition hover:-translate-y-0.5 hover:border-black/25;
+}
+
+html.dark .theme-toggle {
+  @apply border-white/10 bg-white/5 text-white hover:border-white/25;
+}
+
+.theme-toggle-icon {
+  @apply inline-flex h-7 w-7 items-center justify-center rounded-full bg-black text-white;
+}
+
+html.dark .theme-toggle-icon {
+  @apply bg-white text-black;
+}
+
+.skeleton {
+  @apply animate-pulse rounded-2xl bg-black/5;
+}
+
+html.dark .skeleton {
+  @apply bg-white/10;
+}

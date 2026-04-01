@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ledgerread-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ledgerread
+    ports:
+      - "5432:5432"
+    volumes:
+      - ledgerread-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ledgerread"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ledgerread-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ledgerread
+      APP_BASE_URL: http://localhost:4000
+      SESSION_TTL_MINUTES: 30
+      EVIDENCE_STORAGE_ROOT: /var/lib/ledgerread/evidence
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./.ledgerread-runtime:/var/lib/ledgerread/runtime
+      - ledgerread-evidence:/var/lib/ledgerread/evidence
+
+volumes:
+  ledgerread-postgres-data:
+  ledgerread-evidence:

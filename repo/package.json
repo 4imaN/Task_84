@@ -1,0 +1,29 @@
+{
+  "name": "ledgerread",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build:shared": "npm run build -w @ledgerread/contracts && npm run build -w @ledgerread/crypto && npm run build -w @ledgerread/db",
+    "build:api": "npm run build:shared && npm run build -w @ledgerread/api",
+    "build:web": "npm run build:shared && npm run build -w @ledgerread/web",
+    "build": "npm run build:api && npm run build:web",
+    "dev:api": "npm run dev -w @ledgerread/api",
+    "dev:web": "npm run dev -w @ledgerread/web",
+    "test:api": "node scripts/run-api-tests.mjs",
+    "test:api:local": "node scripts/run-api-tests-local.mjs",
+    "smoke:api:local": "node scripts/run-api-smoke-local.mjs",
+    "test:web": "npm run build:shared && npm run test -w @ledgerread/web",
+    "test:web:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.54.2",
+    "typescript": "^5.7.3"
+  },
+  "dependencies": {
+    "@as-integrations/express5": "^1.1.2"
+  }
+}
