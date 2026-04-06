@@ -12,6 +12,7 @@ describe('api transport and telemetry', () => {
       workspace: 'app',
     },
     homePath: '/app/library',
+    csrfToken: 'csrf-session-1',
   };
 
   beforeEach(() => {
@@ -96,6 +97,7 @@ describe('api transport and telemetry', () => {
         credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
+          'X-CSRF-Token': 'csrf-session-1',
         },
       }),
     );
@@ -110,6 +112,32 @@ describe('api transport and telemetry', () => {
           traceId: 'trace-graphql-1',
         }),
       ]),
+    );
+  });
+
+  it('attaches the session CSRF token to unsafe REST requests', async () => {
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'x-trace-id': 'trace-rest-2',
+        },
+      }),
+    );
+
+    await apiRequest('/auth/logout', { method: 'POST' }, session);
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      expect.stringContaining('/auth/logout'),
+      expect.objectContaining({
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': 'csrf-session-1',
+        },
+      }),
     );
   });
 });

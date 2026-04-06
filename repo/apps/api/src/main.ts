@@ -5,19 +5,35 @@ import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import type { Request, Response } from 'express';
-import { loadConfig } from './config/app-config';
+import { isAllowedMutationOrigin } from './common/allowed-origins';
+import { loadConfig, type AppConfig } from './config/app-config';
 import { AppModule } from './app.module';
 
-async function bootstrap() {
-  const config = loadConfig();
-  const allowedOrigins = Array.from(
-    new Set([config.appBaseUrl, 'http://localhost:4173', 'http://127.0.0.1:4173']),
-  );
-  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
-    cors: {
-      origin: allowedOrigins,
+const CORS_METHODS = ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'];
+const CORS_ALLOWED_HEADERS = ['Content-Type', 'X-Trace-Id', 'X-CSRF-Token'];
+const CORS_EXPOSED_HEADERS = ['x-trace-id'];
+
+export const createBootstrapApp = async (providedConfig?: AppConfig) => {
+  const config = providedConfig ?? loadConfig();
+  const allowedOrigins = new Set(config.allowedOrigins);
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, { cors: false });
+  app.set('trust proxy', config.trustedProxyHops);
+
+  app.enableCors((request, callback) => {
+    const originHeader = request.header('origin');
+    const originAllowed =
+      !originHeader ||
+      isAllowedMutationOrigin(originHeader, allowedOrigins, request.headers, {
+        trustForwardedHost: config.trustedProxyHops > 0,
+      });
+
+    callback(null, {
+      origin: originAllowed,
       credentials: true,
-    },
+      methods: CORS_METHODS,
+      allowedHeaders: CORS_ALLOWED_HEADERS,
+      exposedHeaders: CORS_EXPOSED_HEADERS,
+    });
   });
 
   app.useGlobalPipes(
@@ -75,7 +91,14 @@ async function bootstrap() {
     });
   }
 
+  return { app, config };
+};
+
+export async function bootstrap() {
+  const { app, config } = await createBootstrapApp();
   await app.listen(config.port);
 }
 
-void bootstrap();
+if (require.main === module) {
+  void bootstrap();
+}

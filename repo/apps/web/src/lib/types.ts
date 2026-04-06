@@ -3,6 +3,7 @@ import type { ReadingProfileRecord, SessionUser } from '@ledgerread/contracts';
 export type AppSession = {
   user: SessionUser;
   homePath: string;
+  csrfToken: string;
 };
 
 export type Toast = {
@@ -15,6 +16,7 @@ export type TitleCard = {
   slug: string;
   name: string;
   format: string;
+  isReadable: boolean;
   price: number;
   inventoryOnHand: number;
   authorName: string;
@@ -44,6 +46,7 @@ export type TitleDetail = {
   slug: string;
   name: string;
   format: string;
+  isReadable: boolean;
   price: number;
   inventoryOnHand: number;
   authorName: string;
@@ -109,14 +112,16 @@ export type SettlementResponse = {
   paymentPlans: Array<{
     id: string;
     supplier_name: string;
-    status: string;
+    status: PaymentPlanStatus;
     created_at: string;
+    updated_at: string;
     statement_reference?: string | null;
     invoice_reference?: string | null;
     freight_cents?: number | null;
     surcharge_cents?: number | null;
     invoiceAmount?: number;
     landedCost?: number;
+    allowedTransitions: PaymentPlanStatus[];
   }>;
   discrepancies: Array<{
     id: string;
@@ -124,10 +129,12 @@ export type SettlementResponse = {
     quantity_difference: number;
     amount_difference_cents: number;
     amountDifference: number;
-    status: string;
+    status: DiscrepancyStatus;
     created_at: string;
+    updated_at: string;
     statement_reference?: string | null;
     invoice_reference?: string | null;
+    allowedTransitions: DiscrepancyStatus[];
   }>;
 };
 
@@ -137,9 +144,8 @@ export type AuditLog = {
   action: string;
   entity_type: string;
   entity_id: string;
-  payload: Record<string, unknown>;
-  previous_hash: string | null;
-  current_hash: string;
+  payload: Record<string, string | number | boolean | null>;
+  redacted_fields: number;
   created_at: string;
 };
 
@@ -199,3 +205,17 @@ export type RiskAlert = {
 
 export type PaymentMethod = 'CASH' | 'EXTERNAL_TERMINAL';
 export type PaymentPlanStatus = 'PENDING' | 'MATCHED' | 'PARTIAL' | 'PAID' | 'DISPUTED';
+export type DiscrepancyStatus = 'OPEN' | 'UNDER_REVIEW' | 'RESOLVED' | 'WAIVED';
+
+export type AuditIntegrityResponse = {
+  auditLogs: {
+    valid: boolean;
+    checkedEntries: number;
+    issues: Array<{ rowId: string; reason: string }>;
+  };
+  attendanceRecords: {
+    valid: boolean;
+    checkedEntries: number;
+    issues: Array<{ rowId: string; reason: string }>;
+  };
+};

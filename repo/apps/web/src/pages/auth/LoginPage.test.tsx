@@ -33,6 +33,7 @@ describe('LoginPage', () => {
         workspace: 'app',
       },
       homePath: '/app/library',
+      csrfToken: 'csrf-login-1',
     });
 
     const queryClient = new QueryClient();

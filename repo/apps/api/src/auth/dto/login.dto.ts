@@ -1,4 +1,4 @@
-import { IsIn, IsString, Matches, MinLength } from 'class-validator';
+import { IsIn, IsString } from 'class-validator';
 import type { Workspace } from '@ledgerread/contracts';
 
 export class LoginDto {
@@ -6,8 +6,6 @@ export class LoginDto {
   username!: string;
 
   @IsString()
-  @MinLength(10)
-  @Matches(/^(?=.*[0-9])(?=.*[^A-Za-z0-9]).{10,}$/)
   password!: string;
 
   @IsString()

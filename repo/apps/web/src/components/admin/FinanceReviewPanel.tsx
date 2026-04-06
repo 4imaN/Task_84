@@ -6,6 +6,17 @@ import type { SettlementResponse } from '../../lib/types';
 
 type FinanceReviewPanelProps = {
   auditPath: string;
+  canUpdateDiscrepancies: boolean;
+  canUpdatePaymentPlans: boolean;
+  isPending: (key: string) => boolean;
+  onUpdateDiscrepancyStatus: (
+    discrepancyId: string,
+    status: SettlementResponse['discrepancies'][number]['status'],
+  ) => Promise<void>;
+  onUpdatePaymentPlanStatus: (
+    paymentPlanId: string,
+    status: SettlementResponse['paymentPlans'][number]['status'],
+  ) => Promise<void>;
   settlements: {
     data: SettlementResponse | undefined;
     isPending: boolean;
@@ -14,7 +25,15 @@ type FinanceReviewPanelProps = {
   };
 };
 
-export function FinanceReviewPanel({ auditPath, settlements }: FinanceReviewPanelProps) {
+export function FinanceReviewPanel({
+  auditPath,
+  canUpdateDiscrepancies,
+  canUpdatePaymentPlans,
+  isPending,
+  onUpdateDiscrepancyStatus,
+  onUpdatePaymentPlanStatus,
+  settlements,
+}: FinanceReviewPanelProps) {
   return (
     <section className="shell-panel min-w-0 w-full p-6">
       <p className="font-ui text-xs uppercase tracking-[0.25em] text-black/45 dark:text-white/45">
@@ -61,6 +80,21 @@ export function FinanceReviewPanel({ auditPath, settlements }: FinanceReviewPane
                       <p className="mt-2 font-ui text-sm text-black/55 dark:text-white/55">
                         Invoice {currency(plan.invoiceAmount ?? 0)} · Landed Cost {currency(plan.landedCost ?? 0)}
                       </p>
+                      {canUpdatePaymentPlans && plan.allowedTransitions.length > 0 ? (
+                        <div className="mt-4 flex flex-wrap gap-2">
+                          {plan.allowedTransitions.map((status) => (
+                            <button
+                              key={status}
+                              type="button"
+                              className="button-secondary"
+                              disabled={isPending(`payment-plan-${plan.id}-${status}`)}
+                              onClick={() => void onUpdatePaymentPlanStatus(plan.id, status)}
+                            >
+                              Mark {status}
+                            </button>
+                          ))}
+                        </div>
+                      ) : null}
                     </div>
                   ))
                 ) : (
@@ -81,7 +115,12 @@ export function FinanceReviewPanel({ auditPath, settlements }: FinanceReviewPane
                 </span>
               </div>
               <div className="mt-4">
-                <DiscrepancyReviewSection discrepancies={settlements.data?.discrepancies ?? []} />
+                <DiscrepancyReviewSection
+                  canUpdateDiscrepancies={canUpdateDiscrepancies}
+                  discrepancies={settlements.data?.discrepancies ?? []}
+                  isPending={isPending}
+                  onUpdateDiscrepancyStatus={onUpdateDiscrepancyStatus}
+                />
               </div>
             </div>
 

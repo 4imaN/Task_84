@@ -36,6 +36,7 @@ export function AttendancePage() {
     file && expectedChecksum.trim() && localChecksum && expectedChecksum.trim() !== localChecksum,
   );
   const invalidEvidenceType = Boolean(file && !ALLOWED_TYPES.has(file.type));
+  const checksumRequired = Boolean(file && !expectedChecksum.trim());
 
   const handleFileChange = async (nextFile: File | null) => {
     setFile(nextFile);
@@ -70,6 +71,11 @@ export function AttendancePage() {
   const submit = async (eventType: 'clock-in' | 'clock-out') => {
     if (checksumMismatch) {
       addToast('Fix the checksum mismatch before submitting attendance evidence.');
+      return;
+    }
+
+    if (checksumRequired) {
+      addToast('Enter the expected checksum before submitting attendance evidence.');
       return;
     }
 
@@ -125,7 +131,7 @@ export function AttendancePage() {
               );
             }
           }}
-          placeholder="Optional expected checksum"
+          placeholder="Expected checksum"
         />
         <input
           className="field mt-4"
@@ -143,19 +149,24 @@ export function AttendancePage() {
                 Local SHA-256: {localChecksum}
               </p>
             ) : null}
+            {checksumRequired ? (
+              <p className="mt-2 text-[11px] uppercase tracking-[0.12em] text-black/45 dark:text-white/45">
+                Enter the expected checksum to submit this evidence file.
+              </p>
+            ) : null}
           </div>
         ) : null}
         <div className="mt-4 flex gap-3">
           <button
             className="button-primary"
-            disabled={checksumMismatch || invalidEvidenceType || isPending('attendance-clock-in')}
+            disabled={checksumMismatch || checksumRequired || invalidEvidenceType || isPending('attendance-clock-in')}
             onClick={() => submit('clock-in')}
           >
             {isPending('attendance-clock-in') ? 'Clocking In...' : 'Clock In'}
           </button>
           <button
             className="button-secondary"
-            disabled={checksumMismatch || invalidEvidenceType || isPending('attendance-clock-out')}
+            disabled={checksumMismatch || checksumRequired || invalidEvidenceType || isPending('attendance-clock-out')}
             onClick={() => submit('clock-out')}
           >
             {isPending('attendance-clock-out') ? 'Clocking Out...' : 'Clock Out'}

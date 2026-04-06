@@ -4,6 +4,7 @@ import type { SessionUser } from '@ledgerread/contracts';
 import { AuthGuard } from '../auth/auth.guard';
 import { AllowedRoles } from '../auth/roles.decorator';
 import { RolesGuard } from '../auth/roles.guard';
+import { graphQlUuidPipe } from '../common/graphql-uuid.pipe';
 import { CurrentUser } from '../common/current-user.decorator';
 import { CatalogService } from './catalog.service';
 import { CatalogModel, CommunityThreadModel, TitleDetailModel } from '../graphql/models';
@@ -21,14 +22,19 @@ export class CatalogResolver {
 
   @Query(() => TitleDetailModel)
   @AllowedRoles('CUSTOMER')
-  title(@CurrentUser() user: SessionUser, @Args('id') id: string) {
+  title(
+    @CurrentUser() user: SessionUser,
+    @Args('id', graphQlUuidPipe) id: string,
+  ) {
     return this.catalogService.getTitle(user, id);
   }
 
   @Query(() => CommunityThreadModel)
   @AllowedRoles('CUSTOMER')
-  communityThread(@CurrentUser() user: SessionUser, @Args('titleId') titleId: string) {
+  communityThread(
+    @CurrentUser() user: SessionUser,
+    @Args('titleId', graphQlUuidPipe) titleId: string,
+  ) {
     return this.catalogService.getCommunityThread(user, titleId);
   }
 }
-

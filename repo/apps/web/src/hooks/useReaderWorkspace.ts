@@ -119,10 +119,19 @@ export function useReaderWorkspace(titleId: string | undefined) {
   const resolvedTitle = title.data?.title ?? offlineTitle;
   const activePreferences = profile?.preferences ?? resolvedTitle?.readingPreferences;
   const chapters = resolvedTitle?.chapters ?? [];
+  const resolvedTitleIsReadable = Boolean(
+    resolvedTitle &&
+      resolvedTitle.format === 'DIGITAL' &&
+      chapters.length > 0 &&
+      resolvedTitle.isReadable !== false,
+  );
   const selectedChapter = chapters[Math.min(pageIndex, Math.max(chapters.length - 1, 0))];
   const titleErrorMessage =
     title.error instanceof Error ? title.error.message : 'The title could not be loaded from the local server.';
   const usingOfflineCache = Boolean(title.isError && offlineTitle);
+  const isUnreadableRoute =
+    !resolvedTitleIsReadable &&
+    (Boolean(resolvedTitle) || titleErrorMessage.includes('not available in the reader workspace'));
 
   useEffect(() => {
     if (!session || profile || !resolvedTitle) {
@@ -250,5 +259,7 @@ export function useReaderWorkspace(titleId: string | undefined) {
     readerSurfaceClass,
     activePreferences,
     getReaderFontFamily,
+    resolvedTitleIsReadable,
+    isUnreadableRoute,
   };
 }

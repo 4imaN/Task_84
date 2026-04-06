@@ -1,16 +1,17 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, unlink, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { SessionUser } from '@ledgerread/contracts';
 import type { AppConfig } from '../config/app-config';
-import { AuditService } from '../audit/audit.service';
+import { AuditService, type HashChainVerificationResult } from '../audit/audit.service';
 import { DatabaseService, type Queryable } from '../database/database.service';
 import { SecurityService } from '../security/security.service';
 import type { AttendanceDto } from './dto/attendance.dto';
@@ -57,6 +58,10 @@ export class AttendanceService {
     private readonly auditService: AuditService,
   ) {}
 
+  private get attendanceClientClockSkewSeconds() {
+    return this.configService.get('attendanceClientClockSkewSeconds', { infer: true });
+  }
+
   private writeAttendanceLog(
     level: 'log' | 'warn',
     event: string,
@@ -67,6 +72,19 @@ export class AttendanceService {
       .map(([key, value]) => `${key}=${value}`)
       .join(' ');
     this.logger[level](`ATTENDANCE_${event}${details ? ` ${details}` : ''}`);
+  }
+
+  private toIsoString(value: Date | string | null | undefined) {
+    if (value === null || value === undefined) {
+      return null;
+    }
+
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) {
+      return null;
+    }
+
+    return parsed.toISOString();
   }
 
   private async getRuleVersionId(ruleKey: string, queryable: Queryable = this.databaseService) {
@@ -93,8 +111,8 @@ export class AttendanceService {
 
     const inserted = await queryable.query(
       `
-      INSERT INTO risk_alerts (attendance_record_id, rule_version_id, description)
-      SELECT attendance_records.id, $1, 'Missing clock-out after 12 hours.'
+      INSERT INTO risk_alerts (attendance_record_id, rule_version_id, description, user_id)
+      SELECT attendance_records.id, $1, 'Missing clock-out after 12 hours.', attendance_records.user_id
       FROM attendance_records
       WHERE attendance_records.event_type = 'CLOCK_IN'
         AND attendance_records.occurred_at <= NOW() - INTERVAL '12 hours'
@@ -130,11 +148,23 @@ export class AttendanceService {
     }
   }
 
-  private async persistEvidence(traceId: string, file?: UploadedEvidenceFile) {
-    if (!file) {
-      return null;
-    }
+  private async recordChecksumMismatchAlert(userId: string) {
+    const ruleVersionId = await this.getRuleVersionId('evidence-file-mismatch');
+    await this.databaseService.query(
+      `
+      INSERT INTO risk_alerts (attendance_record_id, rule_version_id, description, user_id)
+      VALUES ($1, $2, $3, $4)
+      `,
+      [null, ruleVersionId, 'Evidence file checksum mismatch.', userId],
+    );
+  }
 
+  private async persistEvidence(
+    traceId: string,
+    userId: string,
+    file: UploadedEvidenceFile,
+    expectedChecksum: string,
+  ) {
     const detectedType = detectEvidenceType(file.buffer);
     if (!detectedType) {
       this.writeAttendanceLog('warn', 'EVIDENCE_REJECTED', {
@@ -149,6 +179,14 @@ export class AttendanceService {
     await mkdir(storageRoot, { recursive: true });
 
     const checksum = this.securityService.checksum(file.buffer);
+    if (checksum !== expectedChecksum) {
+      await this.recordChecksumMismatchAlert(userId);
+      this.writeAttendanceLog('warn', 'CHECKSUM_MISMATCH', {
+        traceId,
+      });
+      throw new BadRequestException('Evidence checksum did not match the uploaded file.');
+    }
+
     const generatedFilename = `${Date.now()}-${randomUUID()}.${detectedType.extension}`;
     const filePath = resolve(join(storageRoot, generatedFilename));
     if (filePath !== storageRoot && !filePath.startsWith(`${storageRoot}/`)) {
@@ -178,74 +216,110 @@ export class AttendanceService {
     if (body.expectedChecksum && !file) {
       throw new BadRequestException('expectedChecksum requires an evidence file.');
     }
-
-    const evidence = await this.persistEvidence(traceId, file);
-    return this.databaseService.withTransaction(async (client) => {
-      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, ['attendance_records']);
-      const previous = await client.query<{ current_hash: string }>(
-        'SELECT current_hash FROM attendance_records ORDER BY created_at DESC LIMIT 1',
+    if (file && !body.expectedChecksum) {
+      throw new BadRequestException('expectedChecksum is required when evidence is attached.');
+    }
+    const clientOccurredAt = new Date(body.occurredAt);
+    const authoritativeOccurredAt = new Date();
+    const allowedSkewMilliseconds = this.attendanceClientClockSkewSeconds * 1000;
+    if (Math.abs(clientOccurredAt.getTime() - authoritativeOccurredAt.getTime()) > allowedSkewMilliseconds) {
+      throw new BadRequestException(
+        `occurredAt must be within ${this.attendanceClientClockSkewSeconds} seconds of server time.`,
       );
-      const previousHash = previous.rows[0]?.current_hash ?? null;
-      const payload = {
-        userId: user.id,
-        eventType,
-        occurredAt: body.occurredAt,
-        evidenceChecksum: evidence?.evidenceChecksum ?? null,
-      };
-      const currentHash = this.securityService.hashChain(payload, previousHash);
+    }
+    const authoritativeOccurredAtIso = authoritativeOccurredAt.toISOString();
+    const clientOccurredAtIso = clientOccurredAt.toISOString();
 
-      const inserted = await client.query<{ id: string }>(
-        `
-        INSERT INTO attendance_records (user_id, event_type, occurred_at, evidence_path, evidence_mime_type, evidence_checksum, previous_hash, current_hash)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING id
-        `,
-        [
-          user.id,
+    const evidence = file
+      ? await this.persistEvidence(traceId, user.id, file, body.expectedChecksum!)
+      : null;
+    try {
+      return await this.databaseService.withTransaction(async (client) => {
+        await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, ['attendance_records']);
+        const previous = await client.query<{ current_hash: string }>(
+          'SELECT current_hash FROM attendance_records ORDER BY created_at DESC, id DESC LIMIT 1',
+        );
+        const previousHash = previous.rows[0]?.current_hash ?? null;
+        const payload = {
+          userId: user.id,
           eventType,
-          body.occurredAt,
-          evidence?.evidencePath ?? null,
-          evidence?.evidenceMimeType ?? null,
-          evidence?.evidenceChecksum ?? null,
+          occurredAt: authoritativeOccurredAtIso,
+          clientOccurredAt: clientOccurredAtIso,
+          evidenceChecksum: evidence?.evidenceChecksum ?? null,
+        };
+        const currentHash = this.securityService.hashChain(payload, previousHash);
+        const chainSignature = this.securityService.signChain(
+          'attendance',
+          payload,
           previousHash,
           currentHash,
-        ],
-      );
-
-      if (body.expectedChecksum && evidence && body.expectedChecksum !== evidence.evidenceChecksum) {
-        const ruleVersionId = await this.getRuleVersionId('evidence-file-mismatch', client);
-        await client.query(
-          `
-          INSERT INTO risk_alerts (attendance_record_id, rule_version_id, description)
-          VALUES ($1, $2, $3)
-          `,
-          [inserted.rows[0]!.id, ruleVersionId, 'Evidence file checksum mismatch.'],
         );
-        this.writeAttendanceLog('warn', 'CHECKSUM_MISMATCH', {
+
+        const inserted = await client.query<{ id: string }>(
+          `
+          INSERT INTO attendance_records (
+            user_id,
+            event_type,
+            occurred_at,
+            client_occurred_at,
+            evidence_path,
+            evidence_mime_type,
+            evidence_checksum,
+            previous_hash,
+            current_hash,
+            chain_signature
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+          RETURNING id
+          `,
+          [
+            user.id,
+            eventType,
+            authoritativeOccurredAtIso,
+            clientOccurredAtIso,
+            evidence?.evidencePath ?? null,
+            evidence?.evidenceMimeType ?? null,
+            evidence?.evidenceChecksum ?? null,
+            previousHash,
+            currentHash,
+            chainSignature,
+          ],
+        );
+
+        await this.evaluateOverdueClockOuts(user.id, client);
+        await this.auditService.write({
           traceId,
+          actorUserId: user.id,
+          action: `ATTENDANCE_${eventType}`,
+          entityType: 'attendance_record',
+          entityId: inserted.rows[0]!.id,
+          payload,
+        }, client);
+
+        this.writeAttendanceLog('log', 'RECORDED', {
+          traceId,
+          eventType,
+          userId: user.id,
           recordId: inserted.rows[0]!.id,
         });
+
+        return { recordId: inserted.rows[0]!.id };
+      });
+    } catch (error) {
+      if (evidence?.evidencePath) {
+        try {
+          await unlink(evidence.evidencePath);
+        } catch {
+          this.writeAttendanceLog('warn', 'EVIDENCE_CLEANUP_FAILED', {
+            traceId,
+            eventType,
+            userId: user.id,
+          });
+        }
       }
 
-      await this.evaluateOverdueClockOuts(user.id, client);
-      await this.auditService.write({
-        traceId,
-        actorUserId: user.id,
-        action: `ATTENDANCE_${eventType}`,
-        entityType: 'attendance_record',
-        entityId: inserted.rows[0]!.id,
-        payload,
-      }, client);
-
-      this.writeAttendanceLog('log', 'RECORDED', {
-        traceId,
-        eventType,
-        userId: user.id,
-        recordId: inserted.rows[0]!.id,
-      });
-
-      return { recordId: inserted.rows[0]!.id };
-    });
+      throw error;
+    }
   }
 
   clockIn(user: SessionUser, traceId: string, body: AttendanceDto, file?: UploadedEvidenceFile) {
@@ -257,8 +331,15 @@ export class AttendanceService {
   }
 
   async getRiskAlerts(user: SessionUser) {
-    await this.evaluateOverdueClockOuts(user.id);
-    const isClerk = user.role === 'CLERK';
+    const canViewSelfRisks = user.role === 'CLERK';
+    const canViewGlobalRisks =
+      user.role === 'MANAGER' || user.role === 'FINANCE' || user.role === 'INVENTORY_MANAGER';
+    if (!canViewSelfRisks && !canViewGlobalRisks) {
+      throw new ForbiddenException('Attendance risk visibility is restricted for this role.');
+    }
+
+    const selfScopedView = canViewSelfRisks && !canViewGlobalRisks;
+    await this.evaluateOverdueClockOuts(selfScopedView ? user.id : undefined);
     const result = await this.databaseService.query<{
       id: string;
       description: string;
@@ -272,15 +353,16 @@ export class AttendanceService {
              risk_alerts.description,
              risk_alerts.status,
              risk_alerts.created_at,
-             users.username,
-             users.username_cipher
+             COALESCE(attendance_users.username, fallback_users.username) AS username,
+             COALESCE(attendance_users.username_cipher, fallback_users.username_cipher) AS username_cipher
       FROM risk_alerts
-      JOIN attendance_records ON attendance_records.id = risk_alerts.attendance_record_id
-      JOIN users ON users.id = attendance_records.user_id
-      WHERE ($1::boolean = FALSE OR attendance_records.user_id = $2)
+      LEFT JOIN attendance_records ON attendance_records.id = risk_alerts.attendance_record_id
+      LEFT JOIN users AS attendance_users ON attendance_users.id = attendance_records.user_id
+      LEFT JOIN users AS fallback_users ON fallback_users.id = risk_alerts.user_id
+      WHERE ($1::boolean = FALSE OR COALESCE(attendance_records.user_id, risk_alerts.user_id) = $2)
       ORDER BY risk_alerts.created_at DESC
       `,
-      [isClerk, user.id],
+      [selfScopedView, user.id],
     );
 
     return result.rows.map((row) => ({
@@ -289,5 +371,116 @@ export class AttendanceService {
         ? this.securityService.decryptAtRest(row.username_cipher)
         : row.username ?? 'unknown-user',
     }));
+  }
+
+  async verifyIntegrity(queryable: Queryable = this.databaseService): Promise<HashChainVerificationResult> {
+    const result = await queryable.query<{
+      id: string;
+      user_id: string;
+      event_type: 'CLOCK_IN' | 'CLOCK_OUT';
+      occurred_at: Date | string;
+      client_occurred_at: Date | string | null;
+      evidence_checksum: string | null;
+      previous_hash: string | null;
+      current_hash: string;
+      chain_signature: string | null;
+    }>(
+      `
+      SELECT id,
+             user_id,
+             event_type,
+             occurred_at,
+             client_occurred_at,
+             evidence_checksum,
+             previous_hash,
+             current_hash,
+             chain_signature
+      FROM attendance_records
+      ORDER BY created_at ASC, id ASC
+      `,
+    );
+
+    const issues: HashChainVerificationResult['issues'] = [];
+    let previousHash: string | null = null;
+
+    for (const row of result.rows) {
+      if (row.previous_hash !== previousHash) {
+        issues.push({
+          rowId: row.id,
+          reason: 'previous_hash does not match the preceding attendance record.',
+        });
+      }
+
+      const occurredAtIso = this.toIsoString(row.occurred_at);
+      if (!occurredAtIso) {
+        issues.push({
+          rowId: row.id,
+          reason: 'occurred_at is invalid and cannot be verified.',
+        });
+        previousHash = row.current_hash;
+        continue;
+      }
+
+      const clientOccurredAtIso = this.toIsoString(row.client_occurred_at);
+      if (row.client_occurred_at !== null && row.client_occurred_at !== undefined && !clientOccurredAtIso) {
+        issues.push({
+          rowId: row.id,
+          reason: 'client_occurred_at is invalid and was ignored during verification.',
+        });
+      }
+
+      const chainPayload =
+        !clientOccurredAtIso
+          ? {
+              userId: row.user_id,
+              eventType: row.event_type,
+              occurredAt: occurredAtIso,
+              evidenceChecksum: row.evidence_checksum,
+            }
+          : {
+              userId: row.user_id,
+              eventType: row.event_type,
+              occurredAt: occurredAtIso,
+              clientOccurredAt: clientOccurredAtIso,
+              evidenceChecksum: row.evidence_checksum,
+            };
+
+      const expectedHash = this.securityService.hashChain(chainPayload, row.previous_hash);
+
+      if (row.current_hash !== expectedHash) {
+        issues.push({
+          rowId: row.id,
+          reason: 'current_hash does not match the stored attendance payload.',
+        });
+      }
+
+      if (!row.chain_signature) {
+        issues.push({
+          rowId: row.id,
+          reason: 'chain_signature is missing for this attendance record.',
+        });
+      } else {
+        const expectedSignature = this.securityService.signChain(
+          'attendance',
+          chainPayload,
+          row.previous_hash,
+          row.current_hash,
+        );
+        if (row.chain_signature !== expectedSignature) {
+          issues.push({
+            rowId: row.id,
+            reason: 'chain_signature does not match the stored attendance payload.',
+          });
+        }
+      }
+
+      previousHash = row.current_hash;
+    }
+
+    return {
+      valid: issues.length === 0,
+      checkedEntries: result.rows.length,
+      issues,
+    };
   }
 }

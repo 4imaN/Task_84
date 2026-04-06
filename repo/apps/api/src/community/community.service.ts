@@ -6,7 +6,7 @@ import {
 } from '@nestjs/common';
 import type { SessionUser } from '@ledgerread/contracts';
 import { AuditService } from '../audit/audit.service';
-import { DatabaseService } from '../database/database.service';
+import { DatabaseService, type Queryable } from '../database/database.service';
 import type {
   CreateCommentDto,
   CreateReportDto,
@@ -26,102 +26,141 @@ export class CommunityService {
     private readonly auditService: AuditService,
   ) {}
 
-  private async ensureTitleExists(titleId: string) {
-    const result = await this.databaseService.query<{ id: string }>(
-      'SELECT id FROM titles WHERE id = $1',
-      [titleId],
+  private async ensureEntityExists(
+    table: 'titles' | 'users' | 'authors' | 'series',
+    id: string,
+    message: string,
+    queryable: Queryable = this.databaseService,
+  ) {
+    const result = await queryable.query<{ id: string }>(
+      `SELECT id FROM ${table} WHERE id = $1`,
+      [id],
     );
     if (!result.rows[0]) {
-      throw new NotFoundException('Title not found.');
+      throw new NotFoundException(message);
     }
   }
 
+  private async ensureTitleExists(titleId: string, queryable: Queryable = this.databaseService) {
+    await this.ensureEntityExists('titles', titleId, 'Title not found.', queryable);
+  }
+
+  private async ensureUserExists(userId: string, queryable: Queryable = this.databaseService) {
+    await this.ensureEntityExists('users', userId, 'Target user not found.', queryable);
+  }
+
+  private async ensureAuthorExists(authorId: string, queryable: Queryable = this.databaseService) {
+    await this.ensureEntityExists('authors', authorId, 'Author not found.', queryable);
+  }
+
+  private async ensureSeriesExists(seriesId: string, queryable: Queryable = this.databaseService) {
+    await this.ensureEntityExists('series', seriesId, 'Series not found.', queryable);
+  }
+
   async createComment(user: SessionUser, traceId: string, input: CreateCommentDto) {
-    await this.ensureTitleExists(input.titleId);
-    if (input.parentCommentId) {
-      const parent = await this.databaseService.query<{ id: string; title_id: string }>(
+    const normalizedBody = input.body.trim();
+
+    return this.databaseService.withTransaction(async (client) => {
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`community-comment:${user.id}`]);
+
+      await this.ensureTitleExists(input.titleId, client);
+      if (input.parentCommentId) {
+        const parent = await client.query<{ id: string; title_id: string }>(
+          `
+          SELECT id, title_id
+          FROM comments
+          WHERE id = $1
+          `,
+          [input.parentCommentId],
+        );
+
+        if (!parent.rows[0]) {
+          throw new NotFoundException('Parent comment not found.');
+        }
+
+        if (parent.rows[0].title_id !== input.titleId) {
+          throw new BadRequestException('Replies must stay within the same title thread.');
+        }
+      }
+
+      const recentCount = await client.query<{ count: string }>(
         `
-        SELECT id, title_id
+        SELECT COUNT(*)::text AS count
         FROM comments
-        WHERE id = $1
+        WHERE user_id = $1
+          AND created_at >= NOW() - INTERVAL '1 minute'
         `,
-        [input.parentCommentId],
+        [user.id],
       );
 
-      if (!parent.rows[0]) {
-        throw new NotFoundException('Parent comment not found.');
+      if (Number(recentCount.rows[0]?.count ?? 0) >= 10) {
+        throw new ConflictException('Comment rate limit reached for the current minute.');
       }
 
-      if (parent.rows[0].title_id !== input.titleId) {
-        throw new BadRequestException('Replies must stay within the same title thread.');
+      const duplicateFingerprint = normalizeFingerprint(input.titleId, normalizedBody);
+      const duplicate = await client.query<{ id: string }>(
+        `
+        SELECT id
+        FROM comments
+        WHERE user_id = $1
+          AND duplicate_fingerprint = $2
+          AND created_at >= NOW() - INTERVAL '60 seconds'
+        LIMIT 1
+        `,
+        [user.id, duplicateFingerprint],
+      );
+
+      if (duplicate.rows[0]) {
+        throw new ConflictException('Duplicate content detected in the last 60 seconds.');
       }
-    }
 
-    const recentCount = await this.databaseService.query<{ count: string }>(
-      `
-      SELECT COUNT(*)::text AS count
-      FROM comments
-      WHERE user_id = $1
-        AND created_at >= NOW() - INTERVAL '1 minute'
-      `,
-      [user.id],
-    );
+      const words = await client.query<{ word: string }>('SELECT word FROM sensitive_words');
+      const loweredBody = normalizedBody.toLowerCase();
+      const foundWord = words.rows.find((row: { word: string }) =>
+        loweredBody.includes(row.word.toLowerCase()),
+      );
+      if (foundWord) {
+        throw new ConflictException('The comment contains prohibited content.');
+      }
 
-    if (Number(recentCount.rows[0]?.count ?? 0) >= 10) {
-      throw new ConflictException('Comment rate limit reached for the current minute.');
-    }
+      const inserted = await client.query<{ id: string; created_at: string }>(
+        `
+        INSERT INTO comments (title_id, user_id, parent_comment_id, comment_type, body, duplicate_fingerprint)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, created_at
+        `,
+        [
+          input.titleId,
+          user.id,
+          input.parentCommentId ?? null,
+          input.commentType,
+          normalizedBody,
+          duplicateFingerprint,
+        ],
+      );
 
-    const duplicateFingerprint = normalizeFingerprint(input.titleId, input.body);
-    const duplicate = await this.databaseService.query<{ id: string }>(
-      `
-      SELECT id
-      FROM comments
-      WHERE user_id = $1
-        AND duplicate_fingerprint = $2
-        AND created_at >= NOW() - INTERVAL '60 seconds'
-      LIMIT 1
-      `,
-      [user.id, duplicateFingerprint],
-    );
+      const commentId = inserted.rows[0]!.id;
+      await this.auditService.write(
+        {
+          traceId,
+          actorUserId: user.id,
+          action: 'COMMENT_CREATED',
+          entityType: 'comment',
+          entityId: commentId,
+          payload: {
+            titleId: input.titleId,
+            parentCommentId: input.parentCommentId ?? null,
+            commentType: input.commentType,
+          },
+        },
+        client,
+      );
 
-    if (duplicate.rows[0]) {
-      throw new ConflictException('Duplicate content detected in the last 60 seconds.');
-    }
-
-    const words = await this.databaseService.query<{ word: string }>('SELECT word FROM sensitive_words');
-    const loweredBody = input.body.toLowerCase();
-    const foundWord = words.rows.find((row: { word: string }) => loweredBody.includes(row.word.toLowerCase()));
-    if (foundWord) {
-      throw new ConflictException(`The comment contains a sensitive term: ${foundWord.word}.`);
-    }
-
-    const inserted = await this.databaseService.query<{ id: string; created_at: string }>(
-      `
-      INSERT INTO comments (title_id, user_id, parent_comment_id, comment_type, body, duplicate_fingerprint)
-      VALUES ($1, $2, $3, $4, $5, $6)
-      RETURNING id, created_at
-      `,
-      [input.titleId, user.id, input.parentCommentId ?? null, input.commentType, input.body, duplicateFingerprint],
-    );
-
-    const commentId = inserted.rows[0]!.id;
-    await this.auditService.write({
-      traceId,
-      actorUserId: user.id,
-      action: 'COMMENT_CREATED',
-      entityType: 'comment',
-      entityId: commentId,
-      payload: {
-        titleId: input.titleId,
-        parentCommentId: input.parentCommentId ?? null,
-        commentType: input.commentType,
-      },
+      return {
+        id: commentId,
+        createdAt: inserted.rows[0]!.created_at,
+      };
     });
-
-    return {
-      id: commentId,
-      createdAt: inserted.rows[0]!.created_at,
-    };
   }
 
   async createReport(user: SessionUser, traceId: string, input: CreateReportDto) {
@@ -164,6 +203,13 @@ export class CommunityService {
     traceId: string,
     input: RelationshipDto,
   ) {
+    if (input.targetUserId === user.id) {
+      const action = table === 'user_blocks' ? 'block' : 'mute';
+      throw new BadRequestException(`You cannot ${action} yourself.`);
+    }
+
+    await this.ensureUserExists(input.targetUserId);
+
     if (input.active) {
       await this.databaseService.query(
         `
@@ -262,6 +308,8 @@ export class CommunityService {
   }
 
   async updateAuthorSubscription(user: SessionUser, traceId: string, input: SubscribeDto) {
+    await this.ensureAuthorExists(input.targetId);
+
     if (input.active) {
       await this.databaseService.query(
         `
@@ -291,6 +339,8 @@ export class CommunityService {
   }
 
   async updateSeriesSubscription(user: SessionUser, traceId: string, input: SubscribeDto) {
+    await this.ensureSeriesExists(input.targetId);
+
     if (input.active) {
       await this.databaseService.query(
         `

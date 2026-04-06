@@ -1,10 +1,14 @@
 import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { APP_FILTER } from '@nestjs/core';
 import { GraphQLModule } from '@nestjs/graphql';
 import { ApolloDriver, ApolloDriverConfig } from '@nestjs/apollo';
+import { MulterModule } from '@nestjs/platform-express';
 import { ScheduleModule } from '@nestjs/schedule';
-import { loadConfig } from './config/app-config';
+import { memoryStorage } from 'multer';
+import { loadConfig, type AppConfig } from './config/app-config';
 import { DatabaseModule } from './database/database.module';
+import { FileUploadExceptionFilter } from './common/file-upload-exception.filter';
 import { RequestContextMiddleware } from './common/request-context.middleware';
 import type { RequestWithContext } from './common/http';
 import { SecurityModule } from './security/security.module';
@@ -32,6 +36,16 @@ import { RecommendationsService } from './recommendations/recommendations.servic
     ConfigModule.forRoot({
       isGlobal: true,
       load: [loadConfig],
+    }),
+    MulterModule.registerAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (configService: ConfigService<AppConfig, true>) => ({
+        storage: memoryStorage(),
+        limits: {
+          fileSize: configService.get('evidenceUploadMaxBytes', { infer: true }),
+        },
+      }),
     }),
     ScheduleModule.forRoot(),
     GraphQLModule.forRoot<ApolloDriverConfig>({
@@ -65,6 +79,10 @@ import { RecommendationsService } from './recommendations/recommendations.servic
     AdminService,
     RecommendationsService,
     RecommendationsResolver,
+    {
+      provide: APP_FILTER,
+      useClass: FileUploadExceptionFilter,
+    },
   ],
 })
 export class AppModule implements NestModule {

@@ -62,6 +62,9 @@ export class TitleSummaryModel {
   @Field()
   format!: string;
 
+  @Field()
+  isReadable!: boolean;
+
   @Field(() => Float)
   price!: number;
 

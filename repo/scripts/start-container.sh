@@ -23,6 +23,12 @@ if [ "$APP_ENCRYPTION_KEY" = "ledgerread-local-demo-secret" ]; then
   exit 1
 fi
 
-node apps/api/dist/scripts/migrate.js
-node apps/api/dist/scripts/seed.js
+if [ -n "${DATABASE_ADMIN_URL:-}" ]; then
+  APP_DATABASE_URL="${DATABASE_URL}" DATABASE_URL="${DATABASE_ADMIN_URL}" node apps/api/dist/scripts/migrate.js
+  APP_DATABASE_URL="${DATABASE_URL}" DATABASE_URL="${DATABASE_ADMIN_URL}" node apps/api/dist/scripts/seed.js
+else
+  APP_DATABASE_URL="${APP_DATABASE_URL:-${DATABASE_URL:-}}" node apps/api/dist/scripts/migrate.js
+  APP_DATABASE_URL="${APP_DATABASE_URL:-${DATABASE_URL:-}}" node apps/api/dist/scripts/seed.js
+fi
+
 node apps/api/dist/main.js

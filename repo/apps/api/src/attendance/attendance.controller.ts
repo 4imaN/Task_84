@@ -10,11 +10,11 @@ import { AttendanceService, type UploadedEvidenceFile } from './attendance.servi
 
 @Controller('attendance')
 @UseGuards(AuthGuard, RolesGuard)
-@AllowedRoles('CLERK', 'MODERATOR', 'MANAGER', 'FINANCE', 'INVENTORY_MANAGER')
 export class AttendanceController {
   constructor(private readonly attendanceService: AttendanceService) {}
 
   @Post('clock-in')
+  @AllowedRoles('CLERK')
   @UseInterceptors(FileInterceptor('evidence'))
   clockIn(
     @CurrentUser() user: SessionUser,
@@ -26,6 +26,7 @@ export class AttendanceController {
   }
 
   @Post('clock-out')
+  @AllowedRoles('CLERK')
   @UseInterceptors(FileInterceptor('evidence'))
   clockOut(
     @CurrentUser() user: SessionUser,
@@ -37,6 +38,7 @@ export class AttendanceController {
   }
 
   @Get('risks')
+  @AllowedRoles('CLERK', 'MANAGER', 'FINANCE', 'INVENTORY_MANAGER')
   getRisks(@CurrentUser() user: SessionUser) {
     return this.attendanceService.getRiskAlerts(user);
   }

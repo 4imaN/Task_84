@@ -27,8 +27,11 @@ services:
     environment:
       NODE_ENV: production
       PORT: 4000
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ledgerread
+      DATABASE_URL: postgresql://ledgerread_app:ledgerread_app@postgres:5432/ledgerread
+      DATABASE_ADMIN_URL: postgresql://postgres:postgres@postgres:5432/ledgerread
       APP_BASE_URL: http://localhost:4000
+      APP_ALLOWED_ORIGINS: ${APP_ALLOWED_ORIGINS:-http://localhost:4000,http://127.0.0.1:4000,http://localhost:4173,http://127.0.0.1:4173}
+      APP_TRUSTED_PROXY_HOPS: ${APP_TRUSTED_PROXY_HOPS:-0}
       SESSION_TTL_MINUTES: 30
       EVIDENCE_STORAGE_ROOT: /var/lib/ledgerread/evidence
     ports:

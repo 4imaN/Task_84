@@ -2,9 +2,18 @@ import { currency, formatReadableDateTime } from '../../lib/format';
 import type { SettlementResponse } from '../../lib/types';
 
 export function DiscrepancyReviewSection({
+  canUpdateDiscrepancies,
   discrepancies,
+  isPending,
+  onUpdateDiscrepancyStatus,
 }: {
+  canUpdateDiscrepancies?: boolean;
   discrepancies: SettlementResponse['discrepancies'];
+  isPending?: (key: string) => boolean;
+  onUpdateDiscrepancyStatus?: (
+    discrepancyId: string,
+    status: SettlementResponse['discrepancies'][number]['status'],
+  ) => Promise<void>;
 }) {
   if (discrepancies.length === 0) {
     return (
@@ -33,6 +42,21 @@ export function DiscrepancyReviewSection({
           <p className="mt-2 font-ui text-sm text-black/55 dark:text-white/55">
             {item.statement_reference ?? 'No statement ref'} · {item.invoice_reference ?? 'No invoice ref'}
           </p>
+          {canUpdateDiscrepancies && onUpdateDiscrepancyStatus && item.allowedTransitions.length > 0 ? (
+            <div className="mt-4 flex flex-wrap gap-2">
+              {item.allowedTransitions.map((status) => (
+                <button
+                  key={status}
+                  type="button"
+                  className="button-secondary"
+                  disabled={isPending?.(`discrepancy-${item.id}-${status}`)}
+                  onClick={() => void onUpdateDiscrepancyStatus(item.id, status)}
+                >
+                  Mark {status}
+                </button>
+              ))}
+            </div>
+          ) : null}
         </article>
       ))}
     </div>

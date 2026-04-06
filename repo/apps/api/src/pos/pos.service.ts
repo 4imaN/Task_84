@@ -126,9 +126,15 @@ export class PosService {
     clerkUserId: string,
     cartId: string,
     queryable: Queryable = this.databaseService,
+    options?: { lockForUpdate?: boolean },
   ) {
     const cart = await queryable.query<{ id: string; status: string }>(
-      'SELECT id, status FROM carts WHERE id = $1 AND clerk_user_id = $2',
+      `
+      SELECT id, status
+      FROM carts
+      WHERE id = $1 AND clerk_user_id = $2
+      ${options?.lockForUpdate ? 'FOR UPDATE' : ''}
+      `,
       [cartId, clerkUserId],
     );
 
@@ -146,8 +152,10 @@ export class PosService {
     cartId: string,
     cartItemId: string,
     queryable: Queryable = this.databaseService,
+    options?: { lockCartForUpdate?: boolean },
   ) {
-    await this.ensureOpenCart(clerkUserId, cartId, queryable);
+    const openCartOptions = options?.lockCartForUpdate ? { lockForUpdate: true } : undefined;
+    await this.ensureOpenCart(clerkUserId, cartId, queryable, openCartOptions);
     const cartItem = await queryable.query<{ id: string }>(
       `
       SELECT cart_items.id
@@ -340,43 +348,48 @@ export class PosService {
   }
 
   async addItem(user: SessionUser, traceId: string, cartId: string, input: AddCartItemDto) {
-    await this.ensureOpenCart(user.id, cartId);
-    const inventory = await this.databaseService.query<{ id: string }>(
-      'SELECT id FROM inventory_items WHERE sku = $1',
-      [input.sku],
-    );
-    const item = inventory.rows[0];
-    if (!item) {
-      this.logger.warn(`Cart "${cartId}" add failed because SKU "${input.sku}" was not found.`);
-      throw new NotFoundException('SKU not found.');
-    }
+    return this.databaseService.withTransaction(async (client) => {
+      await this.ensureOpenCart(user.id, cartId, client, { lockForUpdate: true });
+      const inventory = await client.query<{ id: string }>(
+        'SELECT id FROM inventory_items WHERE sku = $1',
+        [input.sku],
+      );
+      const item = inventory.rows[0];
+      if (!item) {
+        this.logger.warn(`Cart "${cartId}" add failed because SKU "${input.sku}" was not found.`);
+        throw new NotFoundException('SKU not found.');
+      }
 
-    await this.databaseService.query(
-      `
-      INSERT INTO cart_items (cart_id, inventory_item_id, quantity)
-      VALUES ($1, $2, $3)
-      ON CONFLICT (cart_id, inventory_item_id)
-      DO UPDATE SET quantity = cart_items.quantity + EXCLUDED.quantity
-      `,
-      [cartId, item.id, input.quantity],
-    );
+      await client.query(
+        `
+        INSERT INTO cart_items (cart_id, inventory_item_id, quantity)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (cart_id, inventory_item_id)
+        DO UPDATE SET quantity = cart_items.quantity + EXCLUDED.quantity
+        `,
+        [cartId, item.id, input.quantity],
+      );
 
-    await this.clearReviewState(cartId);
+      await this.clearReviewState(cartId, client);
 
-    await this.auditService.write({
-      traceId,
-      actorUserId: user.id,
-      action: 'CART_ITEM_ADDED',
-      entityType: 'cart',
-      entityId: cartId,
-      payload: {
-        sku: input.sku,
-        quantity: input.quantity,
-      },
+      await this.auditService.write(
+        {
+          traceId,
+          actorUserId: user.id,
+          action: 'CART_ITEM_ADDED',
+          entityType: 'cart',
+          entityId: cartId,
+          payload: {
+            sku: input.sku,
+            quantity: input.quantity,
+          },
+        },
+        client,
+      );
+
+      const computation = await this.computeCart(cartId, client);
+      return this.buildSummary(cartId, computation, null);
     });
-
-    const computation = await this.computeCart(cartId);
-    return this.buildSummary(cartId, computation, null);
   }
 
   async updateItem(
@@ -387,7 +400,9 @@ export class PosService {
     input: UpdateCartItemDto,
   ) {
     return this.databaseService.withTransaction(async (client) => {
-      await this.ensureCartItem(user.id, cartId, cartItemId, client);
+      await this.ensureCartItem(user.id, cartId, cartItemId, client, {
+        lockCartForUpdate: true,
+      });
 
       await client.query(
         `
@@ -421,7 +436,9 @@ export class PosService {
 
   async deleteItem(user: SessionUser, traceId: string, cartId: string, cartItemId: string) {
     return this.databaseService.withTransaction(async (client) => {
-      await this.ensureCartItem(user.id, cartId, cartItemId, client);
+      await this.ensureCartItem(user.id, cartId, cartItemId, client, {
+        lockCartForUpdate: true,
+      });
 
       await client.query('DELETE FROM cart_items WHERE id = $1 AND cart_id = $2', [cartItemId, cartId]);
       await this.clearReviewState(cartId, client);
@@ -445,56 +462,59 @@ export class PosService {
   }
 
   async reviewTotal(user: SessionUser, traceId: string, cartId: string) {
-    await this.ensureOpenCart(user.id, cartId);
-    const computation = await this.computeCart(cartId);
-    if (!computation.lines.length) {
-      throw new ConflictException('Cart is empty.');
-    }
-    if (computation.stockIssues.length) {
-      throw new ConflictException({
-        message: 'Inventory changed before review confirmation.',
-        stockIssues: computation.stockIssues,
-      });
-    }
+    return this.databaseService.withTransaction(async (client) => {
+      await this.ensureOpenCart(user.id, cartId, client, { lockForUpdate: true });
+      const computation = await this.computeCart(cartId, client, { lockRows: true });
+      if (!computation.lines.length) {
+        throw new ConflictException('Cart is empty.');
+      }
+      if (computation.stockIssues.length) {
+        throw new ConflictException({
+          message: 'Inventory changed before review confirmation.',
+          stockIssues: computation.stockIssues,
+        });
+      }
 
-    const reviewed = await this.databaseService.query<{ reviewed_at: string }>(
-      `
-      UPDATE carts
-      SET review_signature = $2,
-          reviewed_at = NOW(),
-          reviewed_total_cents = $3,
-          review_snapshot = $4::jsonb
-      WHERE id = $1
-      RETURNING reviewed_at
-      `,
-      [
-        cartId,
-        computation.reviewSignature,
-        computation.totalCents,
-        JSON.stringify(computation.reviewSnapshot),
-      ],
-    );
+      const reviewed = await client.query<{ reviewed_at: string }>(
+        `
+        UPDATE carts
+        SET review_signature = $2,
+            reviewed_at = NOW(),
+            reviewed_total_cents = $3,
+            review_snapshot = $4::jsonb
+        WHERE id = $1
+        RETURNING reviewed_at
+        `,
+        [
+          cartId,
+          computation.reviewSignature,
+          computation.totalCents,
+          JSON.stringify(computation.reviewSnapshot),
+        ],
+      );
 
-    const reviewedAt = reviewed.rows[0]!.reviewed_at;
+      const reviewedAt = reviewed.rows[0]!.reviewed_at;
 
-    await this.auditService.write({
-      traceId,
-      actorUserId: user.id,
-      action: 'CART_REVIEWED',
-      entityType: 'cart',
-      entityId: cartId,
-      payload: {
-        total: computation.totalCents / 100,
-        reviewSignature: computation.reviewSignature,
-      },
+      await this.auditService.write(
+        {
+          traceId,
+          actorUserId: user.id,
+          action: 'CART_REVIEWED',
+          entityType: 'cart',
+          entityId: cartId,
+          payload: {
+            total: computation.totalCents / 100,
+            reviewSignature: computation.reviewSignature,
+          },
+        },
+        client,
+      );
+
+      return this.buildSummary(cartId, computation, reviewedAt);
     });
-
-    return this.buildSummary(cartId, computation, reviewedAt);
   }
 
   async checkout(user: SessionUser, traceId: string, cartId: string, input: CheckoutDto) {
-    await this.ensureOpenCart(user.id, cartId);
-
     return this.databaseService.withTransaction(async (client) => {
       const cart = await client.query<{
         status: string;

@@ -1,9 +1,45 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import type { SessionUser } from '@ledgerread/contracts';
 import { AuditService } from '../audit/audit.service';
+import { AttendanceService } from '../attendance/attendance.service';
 import { DatabaseService } from '../database/database.service';
 import { SecurityService } from '../security/security.service';
-import type { ImportManifestDto, ManifestItemDto } from './dto/admin.dto';
+import type {
+  ImportManifestDto,
+  ManifestItemDto,
+  UpdateDiscrepancyStatusDto,
+  UpdatePaymentPlanStatusDto,
+} from './dto/admin.dto';
+
+type PaymentPlanStatus = 'PENDING' | 'MATCHED' | 'PARTIAL' | 'PAID' | 'DISPUTED';
+type DiscrepancyStatus = 'OPEN' | 'UNDER_REVIEW' | 'RESOLVED' | 'WAIVED';
+
+const PAYMENT_PLAN_TRANSITIONS: Record<PaymentPlanStatus, PaymentPlanStatus[]> = {
+  PENDING: ['MATCHED', 'PARTIAL', 'DISPUTED'],
+  MATCHED: ['PARTIAL', 'PAID', 'DISPUTED'],
+  PARTIAL: ['PAID', 'DISPUTED'],
+  PAID: [],
+  DISPUTED: ['PENDING', 'MATCHED', 'PARTIAL'],
+};
+
+const DISCREPANCY_TRANSITIONS: Record<DiscrepancyStatus, DiscrepancyStatus[]> = {
+  OPEN: ['UNDER_REVIEW', 'RESOLVED', 'WAIVED'],
+  UNDER_REVIEW: ['OPEN', 'RESOLVED', 'WAIVED'],
+  RESOLVED: ['OPEN'],
+  WAIVED: ['OPEN'],
+};
+
+const SENSITIVE_AUDIT_KEY_PATTERN =
+  /(signature|hash|cipher|token|password|secret|note|notes|body|fingerprint)/i;
+const BASE_VISIBLE_AUDIT_KEY_PATTERN =
+  /(Id|At|sku|quantity|availableQuantity|requestedQuantity|rating|active|category|commentType|paymentMethod|deviceLabel|resolution|status|total|subtotal|discount|fee|price|amount|method)/i;
+const FINANCE_VISIBLE_AUDIT_KEY_PATTERN =
+  /(Id|At|sku|quantity|availableQuantity|requestedQuantity|paymentMethod|resolution|status|total|subtotal|discount|fee|price|amount|method)/i;
 
 interface InventoryValuationRow {
   id: string;
@@ -14,8 +50,9 @@ interface InventoryValuationRow {
 interface PaymentPlanRow {
   id: string;
   supplier_name: string;
-  status: string;
+  status: PaymentPlanStatus;
   created_at: string;
+  updated_at: string;
   statement_reference: string | null;
   invoice_reference: string | null;
   freight_cents: number | null;
@@ -29,8 +66,9 @@ interface DiscrepancyRow {
   sku: string;
   quantity_difference: number;
   amount_difference_cents: number;
-  status: string;
+  status: DiscrepancyStatus;
   created_at: string;
+  updated_at: string;
   statement_reference: string | null;
   invoice_reference: string | null;
 }
@@ -42,6 +80,7 @@ export class AdminService {
   constructor(
     private readonly databaseService: DatabaseService,
     private readonly auditService: AuditService,
+    private readonly attendanceService: AttendanceService,
     private readonly securityService: SecurityService,
   ) {}
 
@@ -79,6 +118,50 @@ export class AdminService {
     return Math.round(
       (previousOnHand * previousAverageCostCents + receivedTotalCostCents) / resultingOnHand,
     );
+  }
+
+  private getAllowedPaymentPlanTransitions(status: PaymentPlanStatus) {
+    return PAYMENT_PLAN_TRANSITIONS[status] ?? [];
+  }
+
+  private getAllowedDiscrepancyTransitions(status: DiscrepancyStatus) {
+    return DISCREPANCY_TRANSITIONS[status] ?? [];
+  }
+
+  private isDateLikeAuditKey(key: string) {
+    return /(At|Date|Timestamp)$/i.test(key) || key.endsWith('_at');
+  }
+
+  private projectAuditPayload(
+    payload: Record<string, unknown>,
+    role: SessionUser['role'],
+  ): { payload: Record<string, string | number | boolean | null>; redactedFields: number } {
+    const visiblePayload: Record<string, string | number | boolean | null> = {};
+    let redactedFields = 0;
+    const rolePattern = role === 'FINANCE' ? FINANCE_VISIBLE_AUDIT_KEY_PATTERN : BASE_VISIBLE_AUDIT_KEY_PATTERN;
+
+    for (const [key, value] of Object.entries(payload)) {
+      if (SENSITIVE_AUDIT_KEY_PATTERN.test(key)) {
+        redactedFields += 1;
+        continue;
+      }
+      if (!rolePattern.test(key) && !this.isDateLikeAuditKey(key)) {
+        redactedFields += 1;
+        continue;
+      }
+
+      if (value === null || ['string', 'number', 'boolean'].includes(typeof value)) {
+        visiblePayload[key] = value as string | number | boolean | null;
+        continue;
+      }
+
+      redactedFields += 1;
+    }
+
+    return {
+      payload: visiblePayload,
+      redactedFields,
+    };
   }
 
   async importManifest(user: SessionUser, traceId: string, input: ImportManifestDto) {
@@ -320,6 +403,7 @@ export class AdminService {
              payment_plans.supplier_name,
              payment_plans.status,
              payment_plans.created_at,
+             payment_plans.updated_at,
              supplier_statements.statement_reference,
              supplier_invoices.invoice_reference,
              supplier_invoices.freight_cents,
@@ -335,6 +419,7 @@ export class AdminService {
                payment_plans.supplier_name,
                payment_plans.status,
                payment_plans.created_at,
+               payment_plans.updated_at,
                supplier_statements.statement_reference,
                supplier_invoices.invoice_reference,
                supplier_invoices.freight_cents,
@@ -351,6 +436,7 @@ export class AdminService {
              reconciliation_discrepancies.amount_difference_cents,
              reconciliation_discrepancies.status,
              reconciliation_discrepancies.created_at,
+             reconciliation_discrepancies.updated_at,
              supplier_statements.statement_reference,
              supplier_invoices.invoice_reference
       FROM reconciliation_discrepancies
@@ -367,15 +453,195 @@ export class AdminService {
         ...row,
         invoiceAmount: Number(row.invoice_amount_cents) / 100,
         landedCost: Number(row.landed_cost_cents) / 100,
+        allowedTransitions: this.getAllowedPaymentPlanTransitions(row.status),
       })),
       discrepancies: discrepancies.rows.map((row) => ({
         ...row,
         amountDifference: row.amount_difference_cents / 100,
+        allowedTransitions: this.getAllowedDiscrepancyTransitions(row.status),
       })),
     };
   }
 
-  async getAuditLogs(limit?: number, action?: string) {
+  async updatePaymentPlanStatus(
+    user: SessionUser,
+    traceId: string,
+    paymentPlanId: string,
+    input: UpdatePaymentPlanStatusDto,
+  ) {
+    return this.databaseService.withTransaction(async (client) => {
+      const paymentPlan = await client.query<{
+        id: string;
+        supplier_name: string;
+        status: PaymentPlanStatus;
+        updated_at: string;
+        statement_reference: string | null;
+        invoice_reference: string | null;
+      }>(
+        `
+        SELECT payment_plans.id,
+               payment_plans.supplier_name,
+               payment_plans.status,
+               payment_plans.updated_at,
+               supplier_statements.statement_reference,
+               supplier_invoices.invoice_reference
+        FROM payment_plans
+        LEFT JOIN supplier_statements ON supplier_statements.id = payment_plans.supplier_statement_id
+        LEFT JOIN supplier_invoices ON supplier_invoices.id = payment_plans.supplier_invoice_id
+        WHERE payment_plans.id = $1
+        FOR UPDATE OF payment_plans
+        `,
+        [paymentPlanId],
+      );
+
+      const current = paymentPlan.rows[0];
+      if (!current) {
+        throw new NotFoundException('Payment plan not found.');
+      }
+
+      if (current.status === input.status) {
+        return {
+          id: current.id,
+          status: current.status,
+          updatedAt: current.updated_at,
+        };
+      }
+
+      const allowedTransitions = this.getAllowedPaymentPlanTransitions(current.status);
+      if (!allowedTransitions.includes(input.status)) {
+        throw new ConflictException(
+          `Payment plan status cannot transition from ${current.status} to ${input.status}.`,
+        );
+      }
+
+      const updated = await client.query<{ id: string; status: PaymentPlanStatus; updated_at: string }>(
+        `
+        UPDATE payment_plans
+        SET status = $2,
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, status, updated_at
+        `,
+        [paymentPlanId, input.status],
+      );
+
+      await this.auditService.write(
+        {
+          traceId,
+          actorUserId: user.id,
+          action: 'PAYMENT_PLAN_STATUS_UPDATED',
+          entityType: 'payment_plan',
+          entityId: current.id,
+          payload: {
+            previousStatus: current.status,
+            status: input.status,
+            supplierName: current.supplier_name,
+            statementReference: current.statement_reference,
+            invoiceReference: current.invoice_reference,
+          },
+        },
+        client,
+      );
+
+      return {
+        id: updated.rows[0]!.id,
+        status: updated.rows[0]!.status,
+        updatedAt: updated.rows[0]!.updated_at,
+      };
+    });
+  }
+
+  async updateDiscrepancyStatus(
+    user: SessionUser,
+    traceId: string,
+    discrepancyId: string,
+    input: UpdateDiscrepancyStatusDto,
+  ) {
+    return this.databaseService.withTransaction(async (client) => {
+      const discrepancy = await client.query<{
+        id: string;
+        sku: string;
+        status: DiscrepancyStatus;
+        updated_at: string;
+        statement_reference: string | null;
+        invoice_reference: string | null;
+      }>(
+        `
+        SELECT reconciliation_discrepancies.id,
+               reconciliation_discrepancies.sku,
+               reconciliation_discrepancies.status,
+               reconciliation_discrepancies.updated_at,
+               supplier_statements.statement_reference,
+               supplier_invoices.invoice_reference
+        FROM reconciliation_discrepancies
+        JOIN supplier_statements
+          ON supplier_statements.id = reconciliation_discrepancies.supplier_statement_id
+        JOIN supplier_invoices
+          ON supplier_invoices.id = reconciliation_discrepancies.supplier_invoice_id
+        WHERE reconciliation_discrepancies.id = $1
+        FOR UPDATE OF reconciliation_discrepancies
+        `,
+        [discrepancyId],
+      );
+
+      const current = discrepancy.rows[0];
+      if (!current) {
+        throw new NotFoundException('Reconciliation discrepancy not found.');
+      }
+
+      if (current.status === input.status) {
+        return {
+          id: current.id,
+          status: current.status,
+          updatedAt: current.updated_at,
+        };
+      }
+
+      const allowedTransitions = this.getAllowedDiscrepancyTransitions(current.status);
+      if (!allowedTransitions.includes(input.status)) {
+        throw new ConflictException(
+          `Reconciliation discrepancy cannot transition from ${current.status} to ${input.status}.`,
+        );
+      }
+
+      const updated = await client.query<{ id: string; status: DiscrepancyStatus; updated_at: string }>(
+        `
+        UPDATE reconciliation_discrepancies
+        SET status = $2,
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, status, updated_at
+        `,
+        [discrepancyId, input.status],
+      );
+
+      await this.auditService.write(
+        {
+          traceId,
+          actorUserId: user.id,
+          action: 'RECONCILIATION_DISCREPANCY_STATUS_UPDATED',
+          entityType: 'reconciliation_discrepancy',
+          entityId: current.id,
+          payload: {
+            previousStatus: current.status,
+            status: input.status,
+            sku: current.sku,
+            statementReference: current.statement_reference,
+            invoiceReference: current.invoice_reference,
+          },
+        },
+        client,
+      );
+
+      return {
+        id: updated.rows[0]!.id,
+        status: updated.rows[0]!.status,
+        updatedAt: updated.rows[0]!.updated_at,
+      };
+    });
+  }
+
+  async getAuditLogs(user: SessionUser, limit?: number, action?: string) {
     const result = await this.databaseService.query<{
       id: string;
       trace_id: string;
@@ -383,20 +649,37 @@ export class AdminService {
       entity_type: string;
       entity_id: string;
       payload: Record<string, unknown>;
-      previous_hash: string | null;
-      current_hash: string;
       created_at: string;
     }>(
       `
-      SELECT id, trace_id, action, entity_type, entity_id, payload, previous_hash, current_hash, created_at
+      SELECT id, trace_id, action, entity_type, entity_id, payload, created_at
       FROM audit_logs
       WHERE ($1::text IS NULL OR action = $1)
-      ORDER BY created_at DESC
+      ORDER BY created_at DESC, id DESC
       LIMIT $2
       `,
       [action ?? null, limit ?? 20],
     );
 
-    return result.rows;
+    return result.rows.map((row) => {
+      const projected = this.projectAuditPayload(row.payload ?? {}, user.role);
+      return {
+        ...row,
+        payload: projected.payload,
+        redacted_fields: projected.redactedFields,
+      };
+    });
+  }
+
+  async getAuditIntegrity() {
+    const [auditLogs, attendanceRecords] = await Promise.all([
+      this.auditService.verifyIntegrity(),
+      this.attendanceService.verifyIntegrity(),
+    ]);
+
+    return {
+      auditLogs,
+      attendanceRecords,
+    };
   }
 }

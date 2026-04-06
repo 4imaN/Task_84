@@ -73,7 +73,66 @@ describe('AuthService', () => {
     );
     expect(databaseService.query).toHaveBeenLastCalledWith(
       expect.stringContaining('failed_login_attempts'),
-      ['user-1', 5],
+      ['user-1'],
+    );
+  });
+
+  it('starts a fresh failure window after lockout expiry without immediate relock', async () => {
+    databaseService.query
+      .mockResolvedValueOnce(
+        queryResult([
+          {
+            id: 'user-1',
+            username: null,
+            username_cipher: 'cipher-inventory',
+            display_name: 'Ivan',
+            role: 'INVENTORY_MANAGER',
+            password_hash: 'hash',
+            is_suspended: false,
+            failed_login_attempts: 5,
+            locked_until: new Date(Date.now() - 60_000).toISOString(),
+          },
+        ]),
+      );
+    mockArgon2.verify.mockResolvedValue(false);
+
+    await expect(service.login('inventory.ivan', 'wrong', 'admin')).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
+    expect(databaseService.query).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining('WHEN locked_until IS NOT NULL AND locked_until <= NOW() THEN 1'),
+      ['user-1'],
+    );
+  });
+
+  it('counts password-policy violations as failed attempts before password hash verification', async () => {
+    databaseService.query
+      .mockResolvedValueOnce(
+        queryResult([
+          {
+            id: 'user-1',
+            username: null,
+            username_cipher: 'cipher-inventory',
+            display_name: 'Ivan',
+            role: 'INVENTORY_MANAGER',
+            password_hash: 'hash',
+            is_suspended: false,
+            failed_login_attempts: 0,
+            locked_until: null,
+          },
+        ]),
+      )
+      .mockResolvedValueOnce(queryResult([]));
+
+    await expect(service.login('inventory.ivan', 'short', 'admin')).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
+    expect(mockArgon2.verify).not.toHaveBeenCalled();
+    expect(databaseService.query).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining('failed_login_attempts'),
+      ['user-1'],
     );
   });
 

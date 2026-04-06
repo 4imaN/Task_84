@@ -18,7 +18,7 @@ export function ReaderPreferencesPanel({
   return (
     <div className="shell-panel grid gap-4 p-5 md:grid-cols-2 xl:grid-cols-4">
       <label className="space-y-2 font-ui text-xs uppercase tracking-[0.2em] text-black/45 dark:text-white/45">
-        Font Size
+        Font Size (pt): {activePreferences.fontSize}
         <input
           className="w-full"
           type="range"

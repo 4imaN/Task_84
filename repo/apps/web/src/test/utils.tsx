@@ -17,6 +17,7 @@ export const createSession = (
     workspace: 'app',
   },
   homePath: '/app/library',
+  csrfToken: 'csrf-token-test',
   ...overrides,
 });
 

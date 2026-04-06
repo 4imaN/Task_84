@@ -9,9 +9,10 @@ import * as argon2 from 'argon2';
 import type { SessionUser, Workspace } from '@ledgerread/contracts';
 import { workspaceRoleMap } from '@ledgerread/contracts';
 import type { AppConfig } from '../config/app-config';
-import { DatabaseService } from '../database/database.service';
+import { DatabaseService, type Queryable } from '../database/database.service';
 import { SecurityService } from '../security/security.service';
 import type { AuthenticatedUserRecord, SessionRecord } from './auth.types';
+import { isPasswordPolicyCompliant } from './password-policy';
 
 @Injectable()
 export class AuthService {
@@ -39,8 +40,13 @@ export class AuthService {
     throw new UnauthorizedException('User identifier could not be resolved.');
   }
 
-  private async findUser(username: string) {
-    const result = await this.databaseService.query<{
+  private async findUser(
+    username: string,
+    queryable: Queryable = this.databaseService,
+    lockForUpdate = false,
+  ) {
+    const lockClause = lockForUpdate ? 'FOR UPDATE' : '';
+    const result = await queryable.query<{
       id: string;
       username: string | null;
       username_cipher: string | null;
@@ -63,6 +69,7 @@ export class AuthService {
              locked_until
       FROM users
       WHERE username_lookup_hash = $1 OR username = $2
+      ${lockClause}
       `,
       [this.securityService.hashLookup(username), username],
     );
@@ -78,24 +85,35 @@ export class AuthService {
     };
   }
 
-  private async registerFailedAttempt(userId: string, currentAttempts: number) {
-    const failedAttempts = currentAttempts + 1;
-    const lockoutWindow = failedAttempts >= 5 ? "NOW() + INTERVAL '15 minutes'" : 'NULL';
-
-    await this.databaseService.query(
+  private async registerFailedAttempt(
+    userId: string,
+    queryable: Queryable = this.databaseService,
+  ) {
+    await queryable.query(
       `
       UPDATE users
-      SET failed_login_attempts = $2,
-          locked_until = ${lockoutWindow},
+      SET failed_login_attempts = CASE
+            WHEN locked_until IS NOT NULL AND locked_until <= NOW() THEN 1
+            ELSE failed_login_attempts + 1
+          END,
+          locked_until = CASE
+            WHEN (
+              CASE
+                WHEN locked_until IS NOT NULL AND locked_until <= NOW() THEN 1
+                ELSE failed_login_attempts + 1
+              END
+            ) >= 5 THEN NOW() + INTERVAL '15 minutes'
+            ELSE NULL
+          END,
           updated_at = NOW()
       WHERE id = $1
       `,
-      [userId, failedAttempts],
+      [userId],
     );
   }
 
-  private async resetFailedAttempts(userId: string) {
-    await this.databaseService.query(
+  private async resetFailedAttempts(userId: string, queryable: Queryable = this.databaseService) {
+    await queryable.query(
       `
       UPDATE users
       SET failed_login_attempts = 0,
@@ -157,9 +175,20 @@ export class AuthService {
       throw new ForbiddenException('This account is suspended.');
     }
 
+    if (!isPasswordPolicyCompliant(password)) {
+      await this.registerFailedAttempt(user.id);
+      this.writeAuthLog('warn', 'LOGIN_FAILED', {
+        traceId,
+        userId: user.id,
+        workspace,
+        reason: 'password_policy_violation',
+      });
+      throw new UnauthorizedException('Invalid username or password.');
+    }
+
     const isValidPassword = await argon2.verify(user.password_hash, password);
     if (!isValidPassword) {
-      await this.registerFailedAttempt(user.id, user.failed_login_attempts);
+      await this.registerFailedAttempt(user.id);
       this.writeAuthLog('warn', 'LOGIN_FAILED', {
         traceId,
         userId: user.id,

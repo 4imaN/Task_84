@@ -9,6 +9,7 @@ import {
   Min,
   ValidateNested,
 } from 'class-validator';
+import { NonBlankString } from '../../common/validation';
 
 export class ReadingPreferencesDto {
   @IsString()
@@ -47,7 +48,7 @@ export class ReadingPreferencesDto {
 }
 
 export class UpsertReadingProfileDto {
-  @IsString()
+  @NonBlankString('deviceLabel')
   deviceLabel!: string;
 
   @ValidateNested()
@@ -60,4 +61,3 @@ export class SyncReadingProfileDto extends UpsertReadingProfileDto {
   @IsBoolean()
   strict!: boolean;
 }
-

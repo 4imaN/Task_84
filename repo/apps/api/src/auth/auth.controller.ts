@@ -1,14 +1,33 @@
 import { Body, Controller, Get, Post, Req, Res, UseGuards } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import type { Response } from 'express';
+import type { CookieOptions } from 'express';
 import type { RequestWithContext } from '../common/http';
+import type { AppConfig } from '../config/app-config';
 import { AuthGuard } from './auth.guard';
 import { AuthService } from './auth.service';
+import { CsrfService } from './csrf.service';
 import { AUTH_COOKIE_NAME } from './auth.constants';
 import { LoginDto } from './dto/login.dto';
 
 @Controller('auth')
 export class AuthController {
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly csrfService: CsrfService,
+    private readonly configService: ConfigService<AppConfig, true>,
+  ) {}
+
+  private getCookieOptions(): CookieOptions {
+    const appBaseUrl = this.configService.get('appBaseUrl', { infer: true });
+
+    return {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: appBaseUrl.startsWith('https://'),
+      path: '/',
+    };
+  }
 
   @Post('login')
   async login(
@@ -17,15 +36,12 @@ export class AuthController {
     @Res({ passthrough: true }) response: Response,
   ) {
     const session = await this.authService.login(body.username, body.password, body.workspace, req.traceId);
-    response.cookie(AUTH_COOKIE_NAME, session.token, {
-      httpOnly: true,
-      sameSite: 'lax',
-      path: '/',
-    });
+    response.cookie(AUTH_COOKIE_NAME, session.token, this.getCookieOptions());
 
     return {
       user: session.user,
       homePath: session.homePath,
+      csrfToken: this.csrfService.issueToken(session.token),
     };
   }
 
@@ -35,11 +51,7 @@ export class AuthController {
     if (req.token) {
       await this.authService.logout(req.token);
     }
-    response.clearCookie(AUTH_COOKIE_NAME, {
-      httpOnly: true,
-      sameSite: 'lax',
-      path: '/',
-    });
+    response.clearCookie(AUTH_COOKIE_NAME, this.getCookieOptions());
 
     return { ok: true };
   }
@@ -60,6 +72,7 @@ export class AuthController {
                 ? '/finance/settlements'
                 : '/admin/overview',
       traceId: req.traceId,
+      csrfToken: this.csrfService.issueToken(req.token!),
     };
   }
 }

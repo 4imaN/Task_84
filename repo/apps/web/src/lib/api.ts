@@ -10,6 +10,7 @@ let unauthorizedHandler: UnauthorizedHandler | null = null;
 
 export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? DEFAULT_APP_ORIGIN;
 export const GRAPHQL_URL = import.meta.env.VITE_GRAPHQL_URL ?? `${API_BASE_URL}/graphql`;
+const SAFE_HTTP_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 export const setUnauthorizedHandler = (handler: UnauthorizedHandler | null) => {
   unauthorizedHandler = handler;
@@ -36,7 +37,7 @@ export const apiRequest = async <T,>(
   options: RequestInit = {},
   session?: AppSession | null,
 ) => {
-  const method = options.method ?? 'GET';
+  const method = (options.method ?? 'GET').toUpperCase();
   let response: Response;
 
   try {
@@ -45,6 +46,7 @@ export const apiRequest = async <T,>(
       credentials: 'include',
       headers: {
         ...(options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
+        ...(!SAFE_HTTP_METHODS.has(method) && session?.csrfToken ? { 'X-CSRF-Token': session.csrfToken } : {}),
         ...(options.headers ?? {}),
       },
     });
@@ -112,6 +114,7 @@ export const graphQLRequest = async <T,>(
       credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
+        ...(session.csrfToken ? { 'X-CSRF-Token': session.csrfToken } : {}),
       },
       body: JSON.stringify({ query, variables }),
     });

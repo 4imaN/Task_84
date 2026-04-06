@@ -32,7 +32,15 @@ export function FinancePage() {
         onChangeSurchargeAmount={finance.setSurchargeAmount}
         onChangePaymentPlanStatus={finance.setPaymentPlanStatus}
       />
-      <FinanceReviewPanel auditPath={finance.auditPath} settlements={finance.settlements} />
+      <FinanceReviewPanel
+        auditPath={finance.auditPath}
+        canUpdateDiscrepancies={finance.canUpdateDiscrepancies}
+        canUpdatePaymentPlans={finance.canUpdatePaymentPlans}
+        isPending={finance.isPending}
+        onUpdateDiscrepancyStatus={finance.updateDiscrepancyStatus}
+        onUpdatePaymentPlanStatus={finance.updatePaymentPlanStatus}
+        settlements={finance.settlements}
+      />
     </div>
   );
 }

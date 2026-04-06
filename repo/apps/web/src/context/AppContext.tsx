@@ -173,6 +173,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         };
         homePath: string;
         traceId: string;
+        csrfToken: string;
       }>('/auth/session'),
   });
 
@@ -186,6 +187,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const nextSession = {
       user: sessionValidationQuery.data.user,
       homePath: nextHomePath,
+      csrfToken: sessionValidationQuery.data.csrfToken,
     } satisfies AppSession;
 
     setSession((current) => {
@@ -193,7 +195,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
         current?.user.id === nextSession.user.id &&
         current.user.role === nextSession.user.role &&
         current.user.workspace === nextSession.user.workspace &&
-        current.homePath === nextSession.homePath
+        current.homePath === nextSession.homePath &&
+        current.csrfToken === nextSession.csrfToken
       ) {
         return current;
       }

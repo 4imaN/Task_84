@@ -8,11 +8,37 @@ interface CacheEntry {
   value: RecommendationModel;
 }
 
+type RecommendationTraceStrategy =
+  | 'CACHE_HIT'
+  | 'SIMILAR'
+  | 'TOP_N'
+  | 'TIMEOUT_FALLBACK'
+  | 'EMPTY_SNAPSHOT_FALLBACK';
+type SnapshotRecommendationReason = 'SIMILAR' | 'TOP_N';
+type SnapshotTitleRow = {
+  id: string;
+  author_id: string;
+  series_id: string | null;
+  bestseller_rank: number;
+};
+
 @Injectable()
 export class RecommendationsService implements OnModuleInit {
   private readonly cache = new Map<string, CacheEntry>();
 
   constructor(private readonly databaseService: DatabaseService) {}
+
+  private areTitlesSimilar(title: SnapshotTitleRow, candidate: SnapshotTitleRow) {
+    if (candidate.id === title.id) {
+      return false;
+    }
+
+    if (candidate.author_id === title.author_id) {
+      return true;
+    }
+
+    return Boolean(title.series_id && candidate.series_id && candidate.series_id === title.series_id);
+  }
 
   async onModuleInit() {
     await this.refreshSnapshots();
@@ -20,45 +46,27 @@ export class RecommendationsService implements OnModuleInit {
 
   @Cron(CronExpression.EVERY_DAY_AT_MIDNIGHT)
   async refreshSnapshots() {
-    const titles = await this.databaseService.query<{
-      id: string;
-      author_id: string;
-      series_id: string | null;
-      bestseller_rank: number;
-    }>('SELECT id, author_id, series_id, bestseller_rank FROM titles');
+    const titles = await this.databaseService.query<SnapshotTitleRow>(
+      'SELECT id, author_id, series_id, bestseller_rank FROM titles',
+    );
 
     const rows = titles.rows;
     for (const title of rows) {
       const similar = rows
-        .filter(
-          (candidate: {
-            id: string;
-            author_id: string;
-            series_id: string | null;
-            bestseller_rank: number;
-          }) =>
-            candidate.id !== title.id &&
-            (candidate.author_id === title.author_id || candidate.series_id === title.series_id),
-        )
+        .filter((candidate) => this.areTitlesSimilar(title, candidate))
         .sort(
-          (
-            left: { bestseller_rank: number },
-            right: { bestseller_rank: number },
-          ) => left.bestseller_rank - right.bestseller_rank,
+          (left: SnapshotTitleRow, right: SnapshotTitleRow) => left.bestseller_rank - right.bestseller_rank,
         )
         .slice(0, 5)
-        .map((candidate: { id: string }) => candidate.id);
+        .map((candidate: SnapshotTitleRow) => candidate.id);
 
       const topN = rows
-        .filter((candidate: { id: string }) => candidate.id !== title.id)
+        .filter((candidate: SnapshotTitleRow) => candidate.id !== title.id)
         .sort(
-          (
-            left: { bestseller_rank: number },
-            right: { bestseller_rank: number },
-          ) => left.bestseller_rank - right.bestseller_rank,
+          (left: SnapshotTitleRow, right: SnapshotTitleRow) => left.bestseller_rank - right.bestseller_rank,
         )
         .slice(0, 5)
-        .map((candidate: { id: string }) => candidate.id);
+        .map((candidate: SnapshotTitleRow) => candidate.id);
 
       await this.databaseService.query(
         `
@@ -84,7 +92,7 @@ export class RecommendationsService implements OnModuleInit {
     }
   }
 
-  private async writeTrace(traceId: string, titleId: string, strategy: string) {
+  private async writeTrace(traceId: string, titleId: string, strategy: RecommendationTraceStrategy) {
     await this.databaseService.query(
       `
       INSERT INTO recommendation_traces (trace_id, title_id, strategy)
@@ -95,9 +103,9 @@ export class RecommendationsService implements OnModuleInit {
   }
 
   private async loadSnapshotData(titleId: string): Promise<{
-    reason: RecommendationModel['reason'];
+    reason: SnapshotRecommendationReason;
     recommendedTitleIds: string[];
-  }> {
+  } | null> {
     const rows = await this.databaseService.query<{
       snapshot_type: string;
       recommended_title_ids: string[];
@@ -113,13 +121,29 @@ export class RecommendationsService implements OnModuleInit {
 
     const similar = rows.rows.find((row: { snapshot_type: string }) => row.snapshot_type === 'SIMILAR');
     const topN = rows.rows.find((row: { snapshot_type: string }) => row.snapshot_type === 'TOP_N');
-    return {
-      reason: similar?.recommended_title_ids?.length ? 'SIMILAR' : 'TOP_N',
-      recommendedTitleIds: similar?.recommended_title_ids ?? topN?.recommended_title_ids ?? [],
-    };
+
+    if ((similar?.recommended_title_ids?.length ?? 0) > 0) {
+      return {
+        reason: 'SIMILAR',
+        recommendedTitleIds: similar!.recommended_title_ids,
+      };
+    }
+
+    if ((topN?.recommended_title_ids?.length ?? 0) > 0) {
+      return {
+        reason: 'TOP_N',
+        recommendedTitleIds: topN!.recommended_title_ids,
+      };
+    }
+
+    return null;
   }
 
-  private async fallback(titleId: string, traceId: string): Promise<RecommendationModel> {
+  private async fallback(
+    titleId: string,
+    traceId: string,
+    strategy: Extract<RecommendationTraceStrategy, 'TIMEOUT_FALLBACK' | 'EMPTY_SNAPSHOT_FALLBACK'>,
+  ): Promise<RecommendationModel> {
     const bestSellers = await this.databaseService.query<{ id: string }>(
       `
       SELECT id
@@ -131,7 +155,7 @@ export class RecommendationsService implements OnModuleInit {
       [titleId],
     );
 
-    await this.writeTrace(traceId, titleId, 'BESTSELLER_FALLBACK');
+    await this.writeTrace(traceId, titleId, strategy);
 
     return {
       titleId,
@@ -156,7 +180,7 @@ export class RecommendationsService implements OnModuleInit {
       const timer = setTimeout(async () => {
         try {
           settled = true;
-          resolve(await this.fallback(titleId, traceId));
+          resolve(await this.fallback(titleId, traceId, 'TIMEOUT_FALLBACK'));
         } catch (error) {
           reject(error);
         }
@@ -169,6 +193,10 @@ export class RecommendationsService implements OnModuleInit {
           }
           settled = true;
           clearTimeout(timer);
+          if (!value) {
+            resolve(await this.fallback(titleId, traceId, 'EMPTY_SNAPSHOT_FALLBACK'));
+            return;
+          }
           await this.writeTrace(traceId, titleId, value.reason);
           resolve({
             titleId,

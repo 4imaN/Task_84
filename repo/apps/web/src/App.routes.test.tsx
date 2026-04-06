@@ -61,6 +61,7 @@ describe('App routing and session handling', () => {
             },
             homePath: '/admin/overview',
             traceId: 'trace-1',
+            csrfToken: 'csrf-admin-1',
           }),
         } as Response;
       }
@@ -80,6 +81,8 @@ describe('App routing and session handling', () => {
                 amountDifference: 8,
                 status: 'OPEN',
                 created_at: '2026-03-29T10:00:00.000Z',
+                updated_at: '2026-03-29T10:00:00.000Z',
+                allowedTransitions: ['UNDER_REVIEW', 'RESOLVED', 'WAIVED'],
               },
             ],
           }),
@@ -135,6 +138,7 @@ describe('App routing and session handling', () => {
             },
             homePath: '/finance/settlements',
             traceId: 'trace-2',
+            csrfToken: 'csrf-finance-1',
           }),
         } as Response;
       }
@@ -154,6 +158,8 @@ describe('App routing and session handling', () => {
                 amountDifference: 8,
                 status: 'OPEN',
                 created_at: '2026-03-29T10:00:00.000Z',
+                updated_at: '2026-03-29T10:00:00.000Z',
+                allowedTransitions: ['UNDER_REVIEW', 'RESOLVED', 'WAIVED'],
               },
             ],
           }),

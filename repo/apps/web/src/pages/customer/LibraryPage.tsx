@@ -59,14 +59,25 @@ export function LibraryPage() {
               {(catalog.data?.catalog.bestSellers ?? []).map((title, index) => (
                 <button
                   key={title.id}
+                  type="button"
+                  disabled={!title.isReadable}
                   className="flex w-full items-center justify-between rounded-2xl border border-black/10 px-4 py-3 text-left transition hover:border-black/25 hover:bg-black/5 dark:border-white/10 dark:hover:bg-white/5"
-                  onClick={() => navigate(`/app/reader/${title.id}`)}
+                  onClick={() => {
+                    if (title.isReadable) {
+                      navigate(`/app/reader/${title.id}`);
+                    }
+                  }}
                 >
                   <span>
                     <span className="block font-ui text-xs uppercase tracking-[0.2em] text-black/40 dark:text-white/45">
                       #{index + 1}
                     </span>
                     <span className="block pt-1 font-display text-2xl">{title.name}</span>
+                    {!title.isReadable ? (
+                      <span className="block pt-1 font-ui text-xs uppercase tracking-[0.18em] text-black/45 dark:text-white/45">
+                        Reader unavailable
+                      </span>
+                    ) : null}
                   </span>
                   <span className="font-ui text-sm opacity-70">{currency(title.price)}</span>
                 </button>
@@ -77,21 +88,32 @@ export function LibraryPage() {
 
         <section className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
           {(catalog.data?.catalog.featured ?? []).map((title) => (
-            <article
+            <button
               key={title.id}
-              className="shell-panel cursor-pointer p-6 transition hover:-translate-y-1"
-              onClick={() => navigate(`/app/reader/${title.id}`)}
+              type="button"
+              disabled={!title.isReadable}
+              className="shell-panel p-6 text-left transition hover:-translate-y-1 disabled:cursor-not-allowed disabled:opacity-75"
+              onClick={() => {
+                if (title.isReadable) {
+                  navigate(`/app/reader/${title.id}`);
+                }
+              }}
             >
               <p className="font-ui text-xs uppercase tracking-[0.2em] text-black/40 dark:text-white/45">
                 {title.format}
               </p>
               <h3 className="mt-3 font-display text-3xl">{title.name}</h3>
               <p className="mt-3 font-ui text-sm text-black/60 dark:text-white/60">{title.authorName}</p>
+              {!title.isReadable ? (
+                <p className="mt-3 font-ui text-xs uppercase tracking-[0.18em] text-black/45 dark:text-white/45">
+                  Reader unavailable
+                </p>
+              ) : null}
               <div className="mt-6 flex items-center justify-between font-ui text-sm">
                 <span>{currency(title.price)}</span>
                 <span>{title.inventoryOnHand} in stock</span>
               </div>
-            </article>
+            </button>
           ))}
         </section>
       </div>

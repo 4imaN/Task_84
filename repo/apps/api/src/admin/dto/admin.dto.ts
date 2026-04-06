@@ -4,13 +4,18 @@ import {
   IsArray,
   IsIn,
   IsInt,
+  IsOptional,
   IsString,
+  Max,
   Min,
   ValidateNested,
 } from 'class-validator';
+import { NonBlankString, TrimmedString } from '../../common/validation';
+
+export const MAX_AUDIT_LOG_LIMIT = 100;
 
 export class ManifestItemDto {
-  @IsString()
+  @NonBlankString('sku')
   sku!: string;
 
   @Type(() => Number)
@@ -35,16 +40,16 @@ export class ManifestItemDto {
 }
 
 export class ImportManifestDto {
-  @IsString()
+  @NonBlankString('supplierName')
   supplierName!: string;
 
-  @IsString()
+  @NonBlankString('sourceFilename')
   sourceFilename!: string;
 
-  @IsString()
+  @NonBlankString('statementReference')
   statementReference!: string;
 
-  @IsString()
+  @NonBlankString('invoiceReference')
   invoiceReference!: string;
 
   @Type(() => Number)
@@ -66,4 +71,30 @@ export class ImportManifestDto {
   @ValidateNested({ each: true })
   @Type(() => ManifestItemDto)
   items!: ManifestItemDto[];
+}
+
+export class UpdatePaymentPlanStatusDto {
+  @IsString()
+  @IsIn(['PENDING', 'MATCHED', 'PARTIAL', 'PAID', 'DISPUTED'])
+  status!: 'PENDING' | 'MATCHED' | 'PARTIAL' | 'PAID' | 'DISPUTED';
+}
+
+export class UpdateDiscrepancyStatusDto {
+  @IsString()
+  @IsIn(['OPEN', 'UNDER_REVIEW', 'RESOLVED', 'WAIVED'])
+  status!: 'OPEN' | 'UNDER_REVIEW' | 'RESOLVED' | 'WAIVED';
+}
+
+export class GetAuditLogsQueryDto {
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(MAX_AUDIT_LOG_LIMIT)
+  limit?: number;
+
+  @IsOptional()
+  @TrimmedString()
+  @IsString()
+  action?: string;
 }

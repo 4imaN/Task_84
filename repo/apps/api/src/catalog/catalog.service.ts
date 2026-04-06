@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import type { SessionUser } from '@ledgerread/contracts';
 import { DatabaseService } from '../database/database.service';
 import type {
@@ -21,6 +21,7 @@ interface TitleRow {
   author_name: string;
   series_id: string | null;
   series_name: string | null;
+  chapter_count: string | number;
 }
 
 const toIsoTimestamp = (value: unknown) => {
@@ -42,12 +43,17 @@ const toIsoTimestamp = (value: unknown) => {
 export class CatalogService {
   constructor(private readonly databaseService: DatabaseService) {}
 
+  private isReadableTitle(row: Pick<TitleRow, 'format' | 'chapter_count'>) {
+    return row.format === 'DIGITAL' && Number(row.chapter_count) > 0;
+  }
+
   private mapTitle(row: TitleRow): TitleSummaryModel {
     const base: TitleSummaryModel = {
       id: row.id,
       slug: row.slug,
       name: row.name,
       format: row.format,
+      isReadable: this.isReadableTitle(row),
       price: row.price_cents / 100,
       inventoryOnHand: row.inventory_on_hand,
       authorName: row.author_name,
@@ -62,7 +68,7 @@ export class CatalogService {
   }
 
   async getCatalog(): Promise<CatalogModel> {
-    const featured = await this.databaseService.query<TitleRow>(
+    const titles = await this.databaseService.query<TitleRow>(
       `
       SELECT titles.id,
              titles.slug,
@@ -73,38 +79,32 @@ export class CatalogService {
              titles.author_id,
              titles.series_id,
              authors.name AS author_name,
-             series.name AS series_name
+             series.name AS series_name,
+             COUNT(chapters.id)::text AS chapter_count
       FROM titles
       JOIN authors ON authors.id = titles.author_id
       LEFT JOIN series ON series.id = titles.series_id
+      LEFT JOIN chapters ON chapters.title_id = titles.id
+      GROUP BY titles.id,
+               titles.slug,
+               titles.name,
+               titles.format,
+               titles.price_cents,
+               titles.inventory_on_hand,
+               titles.author_id,
+               titles.series_id,
+               authors.name,
+               series.name
       ORDER BY titles.bestseller_rank ASC
-      LIMIT 4
       `,
     );
 
-    const bestSellers = await this.databaseService.query<TitleRow>(
-      `
-      SELECT titles.id,
-             titles.slug,
-             titles.name,
-             titles.format,
-             titles.price_cents,
-             titles.inventory_on_hand,
-             titles.author_id,
-             titles.series_id,
-             authors.name AS author_name,
-             series.name AS series_name
-      FROM titles
-      JOIN authors ON authors.id = titles.author_id
-      LEFT JOIN series ON series.id = titles.series_id
-      ORDER BY titles.bestseller_rank ASC
-      LIMIT 6
-      `,
-    );
+    const featuredRows = titles.rows.slice(0, 4);
+    const bestSellerRows = titles.rows.slice(0, 6);
 
     return {
-      featured: featured.rows.map((row: TitleRow) => this.mapTitle(row)),
-      bestSellers: bestSellers.rows.map((row: TitleRow) => this.mapTitle(row)),
+      featured: featuredRows.map((row: TitleRow) => this.mapTitle(row)),
+      bestSellers: bestSellerRows.map((row: TitleRow) => this.mapTitle(row)),
     };
   }
 
@@ -120,11 +120,23 @@ export class CatalogService {
              titles.author_id,
              titles.series_id,
              authors.name AS author_name,
-             series.name AS series_name
+             series.name AS series_name,
+             COUNT(chapters.id)::text AS chapter_count
       FROM titles
       JOIN authors ON authors.id = titles.author_id
       LEFT JOIN series ON series.id = titles.series_id
+      LEFT JOIN chapters ON chapters.title_id = titles.id
       WHERE titles.id = $1
+      GROUP BY titles.id,
+               titles.slug,
+               titles.name,
+               titles.format,
+               titles.price_cents,
+               titles.inventory_on_hand,
+               titles.author_id,
+               titles.series_id,
+               authors.name,
+               series.name
       `,
       [titleId],
     );
@@ -132,6 +144,10 @@ export class CatalogService {
     const titleRow = title.rows[0];
     if (!titleRow) {
       throw new NotFoundException('Title not found.');
+    }
+
+    if (!this.isReadableTitle(titleRow)) {
+      throw new BadRequestException('This title is not available in the reader workspace.');
     }
 
     const chapters = await this.databaseService.query<{
@@ -222,6 +238,10 @@ export class CatalogService {
       `,
       [titleId, viewer.id],
     );
+    const viewerStateRow = viewerState.rows[0];
+    if (!viewerStateRow) {
+      throw new NotFoundException('Title not found.');
+    }
 
     const commentsResult = await this.databaseService.query<{
       id: string;
@@ -260,15 +280,23 @@ export class CatalogService {
       FROM comments
       JOIN users ON users.id = comments.user_id
       WHERE comments.title_id = $1
-      ORDER BY comments.created_at ASC
+      ORDER BY comments.created_at ASC, comments.id ASC
       `,
       [titleId, viewer.id],
     );
 
-    const commentMap = new Map<string, CommunityCommentModel>();
-    const roots: CommunityCommentModel[] = [];
+    const orderedComments = [...commentsResult.rows].sort((left, right) => {
+      const leftCreatedAt = new Date(left.created_at).getTime();
+      const rightCreatedAt = new Date(right.created_at).getTime();
+      if (leftCreatedAt !== rightCreatedAt) {
+        return leftCreatedAt - rightCreatedAt;
+      }
 
-    for (const row of commentsResult.rows) {
+      return left.id.localeCompare(right.id);
+    });
+
+    const commentMap = new Map<string, CommunityCommentModel>();
+    for (const row of orderedComments) {
       const masked = row.is_hidden || row.viewer_has_blocked || row.author_has_blocked_viewer || row.viewer_has_muted;
       const item: CommunityCommentModel = {
         id: row.id,
@@ -281,10 +309,17 @@ export class CatalogService {
       };
 
       commentMap.set(row.id, item);
+    }
+
+    const roots: CommunityCommentModel[] = [];
+    for (const row of orderedComments) {
+      const item = commentMap.get(row.id)!;
       if (row.parent_comment_id) {
         const parent = commentMap.get(row.parent_comment_id);
         if (parent) {
           parent.replies.push(item);
+        } else {
+          roots.push(item);
         }
       } else {
         roots.push(item);
@@ -303,9 +338,9 @@ export class CatalogService {
 
     return {
       titleId,
-      viewerHasFavorited: Boolean(viewerState.rows[0]?.viewer_has_favorited ?? false),
-      viewerFollowsAuthor: Boolean(viewerState.rows[0]?.viewer_follows_author ?? false),
-      viewerFollowsSeries: Boolean(viewerState.rows[0]?.viewer_follows_series ?? false),
+      viewerHasFavorited: Boolean(viewerStateRow.viewer_has_favorited),
+      viewerFollowsAuthor: Boolean(viewerStateRow.viewer_follows_author),
+      viewerFollowsSeries: Boolean(viewerStateRow.viewer_follows_series),
       comments: roots,
       averageRating: Number(ratings.rows[0]?.average_rating ?? 0),
       totalRatings: Number(ratings.rows[0]?.total_ratings ?? 0),

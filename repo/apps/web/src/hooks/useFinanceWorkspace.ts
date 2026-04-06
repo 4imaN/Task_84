@@ -3,7 +3,12 @@ import { useQuery } from '@tanstack/react-query';
 import { useAppContext } from '../context/AppContext';
 import { useAsyncAction } from './useAsyncAction';
 import { apiRequest } from '../lib/api';
-import type { ManifestLineItem, PaymentPlanStatus, SettlementResponse } from '../lib/types';
+import type {
+  DiscrepancyStatus,
+  ManifestLineItem,
+  PaymentPlanStatus,
+  SettlementResponse,
+} from '../lib/types';
 
 const defaultManifestItems: ManifestLineItem[] = [
   {
@@ -19,6 +24,10 @@ export function useFinanceWorkspace() {
   const { session, addToast } = useAppContext();
   const { isPending, runAction } = useAsyncAction();
   const canImportManifest =
+    session?.user.role === 'MANAGER' || session?.user.role === 'INVENTORY_MANAGER';
+  const canUpdatePaymentPlans =
+    session?.user.role === 'MANAGER' || session?.user.role === 'FINANCE';
+  const canUpdateDiscrepancies =
     session?.user.role === 'MANAGER' || session?.user.role === 'INVENTORY_MANAGER';
   const [supplierName, setSupplierName] = useState('North Pier Press');
   const [sourceFilename, setSourceFilename] = useState('statement-invoice.json');
@@ -147,10 +156,58 @@ export function useFinanceWorkspace() {
     );
   };
 
+  const updatePaymentPlanStatus = async (paymentPlanId: string, status: PaymentPlanStatus) => {
+    await runAction(
+      `payment-plan-${paymentPlanId}-${status}`,
+      async () => {
+        await apiRequest(
+          `/admin/payment-plans/${paymentPlanId}/status`,
+          {
+            method: 'PATCH',
+            body: JSON.stringify({ status }),
+          },
+          session,
+        );
+        await settlements.refetch();
+        return status;
+      },
+      {
+        successMessage: `Payment plan moved to ${status}.`,
+        errorMessage: (error) =>
+          error instanceof Error ? error.message : 'Payment plan status could not be updated.',
+      },
+    );
+  };
+
+  const updateDiscrepancyStatus = async (discrepancyId: string, status: DiscrepancyStatus) => {
+    await runAction(
+      `discrepancy-${discrepancyId}-${status}`,
+      async () => {
+        await apiRequest(
+          `/admin/discrepancies/${discrepancyId}/status`,
+          {
+            method: 'PATCH',
+            body: JSON.stringify({ status }),
+          },
+          session,
+        );
+        await settlements.refetch();
+        return status;
+      },
+      {
+        successMessage: `Discrepancy moved to ${status}.`,
+        errorMessage: (error) =>
+          error instanceof Error ? error.message : 'Discrepancy status could not be updated.',
+      },
+    );
+  };
+
   return {
     addManifestRow,
     auditPath,
     canImportManifest,
+    canUpdateDiscrepancies,
+    canUpdatePaymentPlans,
     freightAmount,
     importManifest,
     invoiceReference,
@@ -172,6 +229,8 @@ export function useFinanceWorkspace() {
     statementReference,
     supplierName,
     surchargeAmount,
+    updateDiscrepancyStatus,
     updateManifestItem,
+    updatePaymentPlanStatus,
   };
 }

@@ -6,6 +6,14 @@ import {
   encryptAtRestValue,
 } from '../security/identifier';
 
+const DEFAULT_DATABASE_URL = 'postgresql://postgres:postgres@localhost:5432/ledgerread';
+
+const quoteIdentifier = (value: string) => `"${value.replace(/"/g, '""')}"`;
+const quoteLiteral = (value: string) => `'${value.replace(/'/g, "''")}'`;
+const legacyMigrationVersionAliases: Record<string, string[]> = {
+  '005_reconciliation_workflow_cleanup': ['005'],
+};
+
 const ensureDatabaseExists = async (databaseUrl: string) => {
   const target = new URL(databaseUrl);
   const databaseName = target.pathname.replace(/^\//, '');
@@ -30,8 +38,86 @@ const ensureDatabaseExists = async (databaseUrl: string) => {
   }
 };
 
+const ensureRuntimeRole = async (adminPool: Pool, runtimeDatabaseUrl: string) => {
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(runtimeDatabaseUrl);
+  } catch {
+    throw new Error('APP_DATABASE_URL is invalid.');
+  }
+
+  const roleName = decodeURIComponent(parsedUrl.username);
+  const rolePassword = parsedUrl.password ? decodeURIComponent(parsedUrl.password) : null;
+  const databaseName = parsedUrl.pathname.replace(/^\//, '');
+
+  if (!roleName || roleName === 'postgres') {
+    return;
+  }
+
+  const existingRole = await adminPool.query<{ exists: boolean }>(
+    'SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1) AS exists',
+    [roleName],
+  );
+
+  const roleIdentifier = quoteIdentifier(roleName);
+  if (!existingRole.rows[0]?.exists) {
+    await adminPool.query(
+      rolePassword
+        ? `CREATE ROLE ${roleIdentifier} LOGIN PASSWORD ${quoteLiteral(rolePassword)}`
+        : `CREATE ROLE ${roleIdentifier} LOGIN`,
+    );
+  } else if (rolePassword) {
+    await adminPool.query(
+      `ALTER ROLE ${roleIdentifier} WITH LOGIN PASSWORD ${quoteLiteral(rolePassword)}`,
+    );
+  } else {
+    await adminPool.query(`ALTER ROLE ${roleIdentifier} WITH LOGIN`);
+  }
+
+  if (databaseName) {
+    await adminPool.query(
+      `GRANT CONNECT ON DATABASE ${quoteIdentifier(databaseName)} TO ${roleIdentifier}`,
+    );
+  }
+};
+
+const normalizeLegacyMigrationVersions = async (pool: Pool) => {
+  for (const [canonicalVersion, legacyVersions] of Object.entries(legacyMigrationVersionAliases)) {
+    for (const legacyVersion of legacyVersions) {
+      await pool.query(
+        `
+        UPDATE schema_migrations
+        SET version = $2
+        WHERE version = $1
+          AND NOT EXISTS (
+            SELECT 1
+            FROM schema_migrations
+            WHERE version = $2
+          )
+        `,
+        [legacyVersion, canonicalVersion],
+      );
+
+      await pool.query(
+        `
+        DELETE FROM schema_migrations
+        WHERE version = $1
+          AND EXISTS (
+            SELECT 1
+            FROM schema_migrations
+            WHERE version = $2
+          )
+        `,
+        [legacyVersion, canonicalVersion],
+      );
+    }
+  }
+};
+
 async function main() {
-  const connectionString = process.env.DATABASE_URL ?? 'postgresql://postgres:postgres@localhost:5432/ledgerread';
+  const connectionString =
+    process.env.DATABASE_ADMIN_URL?.trim() || process.env.DATABASE_URL?.trim() || DEFAULT_DATABASE_URL;
+  const runtimeDatabaseUrl = process.env.APP_DATABASE_URL?.trim() || process.env.DATABASE_URL?.trim();
   const encryptionKey = process.env.APP_ENCRYPTION_KEY?.trim();
   if (!encryptionKey) {
     throw new Error('APP_ENCRYPTION_KEY is required before running migrations.');
@@ -43,12 +129,17 @@ async function main() {
   });
 
   try {
+    if (runtimeDatabaseUrl) {
+      await ensureRuntimeRole(pool, runtimeDatabaseUrl);
+    }
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
         version TEXT PRIMARY KEY,
         applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
+    await normalizeLegacyMigrationVersions(pool);
 
     const appliedVersions = await pool.query<{ version: string }>(
       `

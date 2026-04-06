@@ -97,7 +97,7 @@ describe('AttendancePage', () => {
       contextValue: createAttendanceContext(),
     });
 
-    await userEvent.type(screen.getByPlaceholderText('Optional expected checksum'), 'deadbeef');
+    await userEvent.type(screen.getByPlaceholderText('Expected checksum'), 'deadbeef');
     const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
     await uploadEvidenceFile(fileInput);
 
@@ -105,6 +105,26 @@ describe('AttendancePage', () => {
       expect(screen.getByText('Checksum does not match the expected value.')).toBeInTheDocument();
     });
     expect(screen.getByRole('button', { name: 'Clock In' })).toBeDisabled();
+  });
+
+  it('requires an expected checksum before enabling evidence submission', async () => {
+    const addToast = vi.fn();
+
+    renderWithProviders(<AttendancePage />, {
+      route: '/pos/attendance',
+      queryClient: createAttendanceQueryClient(),
+      contextValue: createAttendanceContext(addToast),
+    });
+
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    await uploadEvidenceFile(fileInput);
+
+    await waitFor(() => {
+      expect(screen.getByText('Enter the expected checksum to submit this evidence file.')).toBeInTheDocument();
+    });
+    expect(screen.getByRole('button', { name: 'Clock In' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Clock Out' })).toBeDisabled();
+    expect(apiRequest).toHaveBeenCalledTimes(1);
   });
 
   it('submits a successful clock-in with valid evidence and refetches risk alerts', async () => {
@@ -130,7 +150,7 @@ describe('AttendancePage', () => {
     });
 
     await screen.findByText(DEFAULT_RISK.description);
-    await userEvent.type(screen.getByPlaceholderText('Optional expected checksum'), CHECKSUM);
+    await userEvent.type(screen.getByPlaceholderText('Expected checksum'), CHECKSUM);
     const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
     const uploadedFile = await uploadEvidenceFile(fileInput);
 
@@ -179,7 +199,7 @@ describe('AttendancePage', () => {
       contextValue: createAttendanceContext(addToast),
     });
 
-    await userEvent.type(screen.getByPlaceholderText('Optional expected checksum'), CHECKSUM);
+    await userEvent.type(screen.getByPlaceholderText('Expected checksum'), CHECKSUM);
     const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
     const uploadedFile = await uploadEvidenceFile(fileInput, {
       filename: 'proof.webp',

@@ -31,6 +31,15 @@ export function ReaderPage() {
   }
 
   if (reader.title.isError && !resolvedTitle && reader.cacheLookupComplete) {
+    if (reader.isUnreadableRoute) {
+      return (
+        <PageState
+          title="Title Not Readable"
+          message="This product is not available in the reader workspace. Open a digital title from the library instead."
+        />
+      );
+    }
+
     return (
       <PageState
         title="Unable To Load Title"
@@ -48,6 +57,15 @@ export function ReaderPage() {
         message="The requested title could not be resolved for this session."
         actionLabel="Retry"
         onAction={() => void reader.title.refetch()}
+      />
+    );
+  }
+
+  if (!reader.resolvedTitleIsReadable) {
+    return (
+      <PageState
+        title="Title Not Readable"
+        message="This product is not available in the reader workspace. Open a digital title from the library instead."
       />
     );
   }

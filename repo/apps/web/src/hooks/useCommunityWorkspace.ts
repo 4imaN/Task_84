@@ -1,10 +1,28 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useAppContext } from '../context/AppContext';
 import { useAsyncAction } from './useAsyncAction';
 import { apiRequest, graphQLRequest } from '../lib/api';
 import { catalogQuery, communityQuery } from '../lib/queries';
 import type { CatalogResponse, CommunityComment, CommunityThreadResponse } from '../lib/types';
+
+export const mergeUniqueTitles = (
+  featured: CatalogResponse['catalog']['featured'],
+  bestSellers: CatalogResponse['catalog']['bestSellers'],
+) => {
+  const merged: CatalogResponse['catalog']['featured'] = [];
+  const seen = new Set<string>();
+
+  for (const title of [...featured, ...bestSellers]) {
+    if (seen.has(title.id)) {
+      continue;
+    }
+    seen.add(title.id);
+    merged.push(title);
+  }
+
+  return merged;
+};
 
 export function useCommunityWorkspace() {
   const { session, addToast } = useAppContext();
@@ -26,11 +44,16 @@ export function useCommunityWorkspace() {
     queryFn: () => graphQLRequest<CatalogResponse>(catalogQuery, undefined, session!),
   });
 
+  const allTitles = useMemo(
+    () => mergeUniqueTitles(catalog.data?.catalog.featured ?? [], catalog.data?.catalog.bestSellers ?? []),
+    [catalog.data?.catalog.featured, catalog.data?.catalog.bestSellers],
+  );
+
   useEffect(() => {
-    if (!titleId && catalog.data?.catalog.featured[0]?.id) {
-      setTitleId(catalog.data.catalog.featured[0].id);
+    if (!titleId && allTitles[0]?.id) {
+      setTitleId(allTitles[0].id);
     }
-  }, [catalog.data, titleId]);
+  }, [allTitles, titleId]);
 
   const thread = useQuery({
     queryKey: ['thread', titleId],
@@ -48,7 +71,6 @@ export function useCommunityWorkspace() {
     setSeriesSubscribed(thread.data.communityThread.viewerFollowsSeries);
   }, [thread.data]);
 
-  const allTitles = [...(catalog.data?.catalog.featured ?? []), ...(catalog.data?.catalog.bestSellers ?? [])];
   const activeTitle = allTitles.find((title) => title.id === titleId) ?? null;
   const threadData = thread.data?.communityThread;
   const comments = threadData?.comments ?? [];

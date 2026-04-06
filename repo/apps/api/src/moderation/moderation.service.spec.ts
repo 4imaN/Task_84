@@ -1,5 +1,5 @@
 import { ModerationService } from './moderation.service';
-import { ConflictException } from '@nestjs/common';
+import { ConflictException, ForbiddenException } from '@nestjs/common';
 
 const queryResult = <T>(rows: T[]) => ({ rows });
 
@@ -32,13 +32,14 @@ describe('ModerationService', () => {
           queryResult([
             {
               id: 'report-1',
+              status: 'OPEN',
               comment_id: 'comment-1',
               comment_author_id: 'user-2',
             },
           ]),
         )
         .mockResolvedValueOnce(queryResult([{ id: 'comment-1', user_id: 'user-2' }]))
-        .mockResolvedValueOnce(queryResult([{ id: 'user-2' }]))
+        .mockResolvedValueOnce(queryResult([{ id: 'user-2', role: 'CUSTOMER' }]))
         .mockResolvedValueOnce(queryResult([]))
         .mockResolvedValueOnce(queryResult([{ id: 'action-1' }]))
         .mockResolvedValueOnce(queryResult([])),
@@ -87,6 +88,7 @@ describe('ModerationService', () => {
         queryResult([
           {
             id: 'report-1',
+            status: 'OPEN',
             comment_id: 'comment-1',
             comment_author_id: 'user-2',
           },
@@ -124,13 +126,14 @@ describe('ModerationService', () => {
           queryResult([
             {
               id: 'report-1',
+              status: 'OPEN',
               comment_id: 'comment-1',
               comment_author_id: 'user-2',
             },
           ]),
         )
         .mockResolvedValueOnce(queryResult([{ id: 'comment-1', user_id: 'user-2' }]))
-        .mockResolvedValueOnce(queryResult([{ id: 'user-2' }]))
+        .mockResolvedValueOnce(queryResult([{ id: 'user-2', role: 'CUSTOMER' }]))
         .mockResolvedValueOnce(queryResult([]))
         .mockResolvedValueOnce(queryResult([{ id: 'action-1' }]))
         .mockResolvedValueOnce(queryResult([])),
@@ -162,5 +165,145 @@ describe('ModerationService', () => {
     expect(emitted).toContain('moderatorUserId=moderator-1');
     expect(emitted).toContain('reportId=report-1');
     expect(emitted).not.toContain('mod.noah');
+  });
+
+  it('forbids suspending privileged targets through moderation', async () => {
+    const transactionClient = {
+      query: jest
+        .fn()
+        .mockResolvedValueOnce(
+          queryResult([
+            {
+              id: 'report-manager-1',
+              status: 'OPEN',
+              comment_id: 'comment-manager-1',
+              comment_author_id: 'manager-1',
+            },
+          ]),
+        )
+        .mockResolvedValueOnce(queryResult([{ id: 'comment-manager-1', user_id: 'manager-1' }]))
+        .mockResolvedValueOnce(queryResult([{ id: 'manager-1', role: 'MANAGER' }])),
+    };
+    databaseService.withTransaction.mockImplementation(
+      async (runner: (client: typeof transactionClient) => Promise<unknown>) => runner(transactionClient),
+    );
+
+    await expect(
+      service.applyAction(
+        {
+          id: 'moderator-1',
+          username: 'mod.noah',
+          role: 'MODERATOR',
+          workspace: 'mod',
+        },
+        'trace-role-1',
+        {
+          reportId: 'report-manager-1',
+          targetCommentId: 'comment-manager-1',
+          targetUserId: 'manager-1',
+          action: 'suspend',
+          notes: 'should fail',
+        },
+      ),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(auditService.write).not.toHaveBeenCalled();
+  });
+
+  it('rejects suspend actions that are not linked to a moderation report', async () => {
+    const transactionClient = {
+      query: jest.fn().mockResolvedValueOnce(queryResult([{ id: 'user-2', role: 'CUSTOMER' }])),
+    };
+    databaseService.withTransaction.mockImplementation(
+      async (runner: (client: typeof transactionClient) => Promise<unknown>) => runner(transactionClient),
+    );
+
+    await expect(
+      service.applyAction(
+        {
+          id: 'moderator-1',
+          username: 'mod.noah',
+          role: 'MODERATOR',
+          workspace: 'mod',
+        },
+        'trace-suspend-report',
+        {
+          targetUserId: 'user-2',
+          action: 'suspend',
+          notes: 'missing report',
+        },
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it.each([
+    ['hide'],
+    ['restore'],
+    ['remove'],
+  ] as const)('rejects %s actions that are not linked to a moderation report', async (action) => {
+    const transactionClient = {
+      query: jest
+        .fn()
+        .mockResolvedValueOnce(queryResult([{ id: 'comment-1', user_id: 'user-2' }]))
+        .mockResolvedValueOnce(queryResult([{ id: 'user-2', role: 'CUSTOMER' }])),
+    };
+    databaseService.withTransaction.mockImplementation(
+      async (runner: (client: typeof transactionClient) => Promise<unknown>) => runner(transactionClient),
+    );
+
+    await expect(
+      service.applyAction(
+        {
+          id: 'moderator-1',
+          username: 'mod.noah',
+          role: 'MODERATOR',
+          workspace: 'mod',
+        },
+        `trace-${action}-report`,
+        {
+          targetCommentId: 'comment-1',
+          action,
+          notes: 'missing report',
+        },
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it.each([
+    ['hide'],
+    ['restore'],
+    ['remove'],
+  ] as const)('rejects %s actions when the linked report has no comment target', async (action) => {
+    const transactionClient = {
+      query: jest.fn().mockResolvedValueOnce(
+        queryResult([
+          {
+            id: 'report-1',
+            status: 'OPEN',
+            comment_id: null,
+            comment_author_id: null,
+          },
+        ]),
+      ),
+    };
+    databaseService.withTransaction.mockImplementation(
+      async (runner: (client: typeof transactionClient) => Promise<unknown>) => runner(transactionClient),
+    );
+
+    await expect(
+      service.applyAction(
+        {
+          id: 'moderator-1',
+          username: 'mod.noah',
+          role: 'MODERATOR',
+          workspace: 'mod',
+        },
+        `trace-${action}-unlinked-report`,
+        {
+          reportId: 'report-1',
+          action,
+          notes: 'report missing comment target',
+        },
+      ),
+    ).rejects.toBeInstanceOf(ConflictException);
   });
 });

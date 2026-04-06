@@ -2,9 +2,13 @@ import * as argon2 from 'argon2';
 import { Pool } from 'pg';
 import { defaultReadingPreferences, seedUsers } from '@ledgerread/db';
 import { createIdentifierLookupHash, encryptAtRestValue } from '../security/identifier';
+import { getPasswordPolicyErrorMessage, isPasswordPolicyCompliant } from '../auth/password-policy';
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL ?? 'postgresql://postgres:postgres@localhost:5432/ledgerread',
+  connectionString:
+    process.env.DATABASE_ADMIN_URL?.trim() ||
+    process.env.DATABASE_URL?.trim() ||
+    'postgresql://postgres:postgres@localhost:5432/ledgerread',
 });
 
 const configuredEncryptionKey = process.env.APP_ENCRYPTION_KEY?.trim();
@@ -12,6 +16,61 @@ if (!configuredEncryptionKey) {
   throw new Error('APP_ENCRYPTION_KEY is required before running the seed script.');
 }
 const encryptionKey: string = configuredEncryptionKey;
+const destructiveResetEnabled = process.env.LEDGERREAD_SEED_RESET === '1';
+const allowDestructiveResetInProduction =
+  process.env.LEDGERREAD_ALLOW_DESTRUCTIVE_SEED_IN_PRODUCTION === '1';
+const baselineSeedKey = 'baseline_seed_version';
+const baselineSeedVersion = 'ledgerread_baseline_v1';
+const requiredTitleSlugs = [
+  'quiet-harbor-digital',
+  'midnight-ledger-digital',
+  'quiet-harbor-print',
+  'staff-handbook',
+] as const;
+const requiredDigitalTitleSlugs = [
+  'quiet-harbor-digital',
+  'midnight-ledger-digital',
+] as const;
+const requiredSensitiveWords = ['spoiler', 'counterfeit', 'abuse'] as const;
+const requiredRuleVersionCount = 2;
+const seedPasswordOverrideEnv = process.env.LEDGERREAD_SEED_PASSWORD_OVERRIDES?.trim();
+
+interface SeedReadiness {
+  state: 'empty' | 'complete' | 'partial';
+  missingArtifacts: string[];
+  shouldBackfillMarker: boolean;
+}
+
+const parseSeedPasswordOverrides = () => {
+  if (!seedPasswordOverrideEnv) {
+    return new Map<string, string>();
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(seedPasswordOverrideEnv);
+  } catch {
+    throw new Error('LEDGERREAD_SEED_PASSWORD_OVERRIDES must be valid JSON when provided.');
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('LEDGERREAD_SEED_PASSWORD_OVERRIDES must be a JSON object keyed by username.');
+  }
+
+  const knownUsernames = new Set(seedUsers.map((user) => user.username));
+  const overrides = new Map<string, string>();
+  for (const [username, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!knownUsernames.has(username)) {
+      throw new Error(`LEDGERREAD_SEED_PASSWORD_OVERRIDES contains unknown username: ${username}`);
+    }
+    if (typeof value !== 'string') {
+      throw new Error(`LEDGERREAD_SEED_PASSWORD_OVERRIDES value for ${username} must be a string.`);
+    }
+    overrides.set(username, value);
+  }
+
+  return overrides;
+};
 
 const upsertLookup = async (
   table: 'authors' | 'series',
@@ -111,11 +170,205 @@ const upsertInventoryItem = async (input: {
   return result.rows[0]!.id;
 };
 
+const ensureSeedMetadataTable = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS seed_metadata (
+      seed_key TEXT PRIMARY KEY,
+      seed_value TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+};
+
+const writeSeedMarker = async () => {
+  await pool.query(
+    `
+    INSERT INTO seed_metadata (seed_key, seed_value, updated_at)
+    VALUES ($1, $2, NOW())
+    ON CONFLICT (seed_key)
+    DO UPDATE SET seed_value = EXCLUDED.seed_value,
+                  updated_at = NOW()
+    `,
+    [baselineSeedKey, baselineSeedVersion],
+  );
+};
+
+const evaluateSeedReadiness = async (): Promise<SeedReadiness> => {
+  await ensureSeedMetadataTable();
+
+  const marker = await pool.query<{ seed_value: string }>(
+    `
+    SELECT seed_value
+    FROM seed_metadata
+    WHERE seed_key = $1
+    `,
+    [baselineSeedKey],
+  );
+  const markerValue = marker.rows[0]?.seed_value ?? null;
+
+  const expectedUserHashes = seedUsers.map((user) =>
+    createIdentifierLookupHash(encryptionKey, user.username),
+  );
+
+  const result = await pool.query<{
+    has_any_seed_data: boolean;
+    matched_seed_user_count: number;
+    matched_seed_title_count: number;
+    matched_seed_chapter_title_count: number;
+    matched_seed_rule_version_count: number;
+    matched_sensitive_word_count: number;
+  }>(
+    `
+    SELECT
+      EXISTS (SELECT 1 FROM users)
+      OR EXISTS (SELECT 1 FROM titles)
+      OR EXISTS (SELECT 1 FROM chapters)
+      OR EXISTS (SELECT 1 FROM rule_versions)
+      OR EXISTS (SELECT 1 FROM sensitive_words) AS has_any_seed_data,
+      (
+        SELECT COUNT(*)::int
+        FROM users
+        WHERE username_lookup_hash = ANY($1::text[])
+      ) AS matched_seed_user_count,
+      (
+        SELECT COUNT(*)::int
+        FROM titles
+        WHERE slug = ANY($2::text[])
+      ) AS matched_seed_title_count,
+      (
+        SELECT COUNT(*)::int
+        FROM (
+          SELECT DISTINCT titles.slug
+          FROM titles
+          JOIN chapters ON chapters.title_id = titles.id
+          WHERE titles.slug = ANY($3::text[])
+        ) AS seeded_digital_titles
+      ) AS matched_seed_chapter_title_count,
+      (
+        SELECT COUNT(*)::int
+        FROM rule_versions
+        WHERE (rule_key = 'missing-clock-out' AND version = 1)
+           OR (rule_key = 'evidence-file-mismatch' AND version = 1)
+      ) AS matched_seed_rule_version_count,
+      (
+        SELECT COUNT(*)::int
+        FROM sensitive_words
+        WHERE word = ANY($4::text[])
+      ) AS matched_sensitive_word_count
+    `,
+    [expectedUserHashes, requiredTitleSlugs, requiredDigitalTitleSlugs, requiredSensitiveWords],
+  );
+
+  const row = result.rows[0];
+  const matchedSeedUserCount = Number(row?.matched_seed_user_count ?? 0);
+  const matchedSeedTitleCount = Number(row?.matched_seed_title_count ?? 0);
+  const matchedSeedChapterTitleCount = Number(row?.matched_seed_chapter_title_count ?? 0);
+  const matchedSeedRuleVersionCount = Number(row?.matched_seed_rule_version_count ?? 0);
+  const matchedSensitiveWordCount = Number(row?.matched_sensitive_word_count ?? 0);
+
+  const missingArtifacts: string[] = [];
+  if (matchedSeedUserCount !== seedUsers.length) {
+    missingArtifacts.push('seed users');
+  }
+  if (matchedSeedTitleCount !== requiredTitleSlugs.length) {
+    missingArtifacts.push('seed titles');
+  }
+  if (matchedSeedChapterTitleCount !== requiredDigitalTitleSlugs.length) {
+    missingArtifacts.push('digital title chapters');
+  }
+  if (matchedSeedRuleVersionCount !== requiredRuleVersionCount) {
+    missingArtifacts.push('rule versions');
+  }
+  if (matchedSensitiveWordCount !== requiredSensitiveWords.length) {
+    missingArtifacts.push('sensitive words');
+  }
+
+  const checklistIsComplete = missingArtifacts.length === 0;
+  if (checklistIsComplete && markerValue === baselineSeedVersion) {
+    return {
+      state: 'complete',
+      missingArtifacts: [],
+      shouldBackfillMarker: false,
+    };
+  }
+
+  if (checklistIsComplete) {
+    return {
+      state: 'complete',
+      missingArtifacts: [],
+      shouldBackfillMarker: true,
+    };
+  }
+
+  if (!row?.has_any_seed_data) {
+    return {
+      state: 'empty',
+      missingArtifacts: [],
+      shouldBackfillMarker: false,
+    };
+  }
+
+  return {
+    state: 'partial',
+    missingArtifacts,
+    shouldBackfillMarker: false,
+  };
+};
+
 async function main() {
+  const seedPasswordOverrides = parseSeedPasswordOverrides();
+
+  if (
+    destructiveResetEnabled &&
+    (process.env.NODE_ENV ?? 'development') === 'production' &&
+    !allowDestructiveResetInProduction
+  ) {
+    throw new Error(
+      'Refusing destructive seed reset in production. Set LEDGERREAD_ALLOW_DESTRUCTIVE_SEED_IN_PRODUCTION=1 to override intentionally.',
+    );
+  }
+
+  const readiness = await evaluateSeedReadiness();
+
+  if (!destructiveResetEnabled) {
+    if (readiness.state === 'complete') {
+      if (readiness.shouldBackfillMarker) {
+        await writeSeedMarker();
+        console.log('Seed marker backfilled from baseline checklist verification.');
+      }
+      console.log('Seed skipped: database baseline is complete. Use LEDGERREAD_SEED_RESET=1 for explicit dev reset.');
+      return;
+    }
+
+    if (readiness.state === 'partial') {
+      const missingDetails = readiness.missingArtifacts.length
+        ? readiness.missingArtifacts.join(', ')
+        : 'baseline artifacts';
+      throw new Error(
+        `Partial seed initialization detected (${missingDetails}). Startup refused to skip seeding. Run LEDGERREAD_SEED_RESET=1 for an explicit local reset or restore the missing baseline records.`,
+      );
+    }
+  }
+
+  if (destructiveResetEnabled) {
+    await pool.query(
+      `
+      DELETE FROM seed_metadata
+      WHERE seed_key = $1
+      `,
+      [baselineSeedKey],
+    );
+  }
+
   const userIds = new Map<string, string>();
 
   for (const user of seedUsers) {
-    const passwordHash = await argon2.hash(user.password);
+    const resolvedPassword = seedPasswordOverrides.get(user.username) ?? user.password;
+    if (!isPasswordPolicyCompliant(resolvedPassword)) {
+      throw new Error(getPasswordPolicyErrorMessage(`Seed password for ${user.username}`));
+    }
+
+    const passwordHash = await argon2.hash(resolvedPassword);
     const usernameLookupHash = createIdentifierLookupHash(encryptionKey, user.username);
     const result = await pool.query<{ id: string }>(
       `
@@ -202,36 +455,33 @@ async function main() {
     bestsellerRank: 4,
   });
 
-  await pool.query('DELETE FROM recommendation_traces');
-  await pool.query('DELETE FROM recommendation_snapshots');
-  await pool.query('DELETE FROM audit_logs');
-  await pool.query('DELETE FROM risk_alerts');
-  await pool.query('DELETE FROM attendance_records');
-  await pool.query('DELETE FROM order_items');
-  await pool.query('DELETE FROM orders');
-  await pool.query('DELETE FROM cart_items');
-  await pool.query('DELETE FROM carts');
-  await pool.query('DELETE FROM moderation_actions');
-  await pool.query('DELETE FROM reports');
-  await pool.query('DELETE FROM comments');
-  await pool.query('DELETE FROM user_blocks');
-  await pool.query('DELETE FROM user_mutes');
-  await pool.query('DELETE FROM favorites');
-  await pool.query('DELETE FROM author_subscriptions');
-  await pool.query('DELETE FROM series_subscriptions');
-  await pool.query('DELETE FROM ratings');
-  await pool.query('DELETE FROM sessions');
-  await pool.query('DELETE FROM inventory_receipts');
-  await pool.query('DELETE FROM reconciliation_discrepancies');
-  await pool.query('DELETE FROM supplier_invoice_lines');
-  await pool.query('DELETE FROM supplier_invoices');
-  await pool.query('DELETE FROM supplier_statement_lines');
-  await pool.query('DELETE FROM supplier_statements');
-  await pool.query('DELETE FROM discrepancy_flags');
-  await pool.query('DELETE FROM supplier_manifest_items');
-  await pool.query('DELETE FROM supplier_manifests');
-  await pool.query('DELETE FROM payment_plans');
-  await pool.query('DELETE FROM bundle_links');
+  if (destructiveResetEnabled) {
+    await pool.query('DELETE FROM recommendation_traces');
+    await pool.query('DELETE FROM recommendation_snapshots');
+    await pool.query('TRUNCATE TABLE risk_alerts, attendance_records, audit_logs RESTART IDENTITY CASCADE');
+    await pool.query('DELETE FROM order_items');
+    await pool.query('DELETE FROM orders');
+    await pool.query('DELETE FROM cart_items');
+    await pool.query('DELETE FROM carts');
+    await pool.query('DELETE FROM moderation_actions');
+    await pool.query('DELETE FROM reports');
+    await pool.query('DELETE FROM comments');
+    await pool.query('DELETE FROM user_blocks');
+    await pool.query('DELETE FROM user_mutes');
+    await pool.query('DELETE FROM favorites');
+    await pool.query('DELETE FROM author_subscriptions');
+    await pool.query('DELETE FROM series_subscriptions');
+    await pool.query('DELETE FROM ratings');
+    await pool.query('DELETE FROM sessions');
+    await pool.query('DELETE FROM inventory_receipts');
+    await pool.query('DELETE FROM reconciliation_discrepancies');
+    await pool.query('DELETE FROM supplier_invoice_lines');
+    await pool.query('DELETE FROM supplier_invoices');
+    await pool.query('DELETE FROM supplier_statement_lines');
+    await pool.query('DELETE FROM supplier_statements');
+    await pool.query('DELETE FROM payment_plans');
+    await pool.query('DELETE FROM bundle_links');
+  }
 
   await pool.query('DELETE FROM chapters');
   const chapterInserts = [
@@ -409,13 +659,16 @@ async function main() {
     VALUES
       ('missing-clock-out', 1, $1::jsonb),
       ('evidence-file-mismatch', 1, $2::jsonb)
-    ON CONFLICT DO NOTHING
+    ON CONFLICT (rule_key, version)
+    DO UPDATE SET definition = EXCLUDED.definition
     `,
     [
       JSON.stringify({ thresholdHours: 12, description: 'Missing clock-out after 12 hours.' }),
       JSON.stringify({ behavior: 'alert', description: 'Evidence file checksum mismatch.' }),
     ],
   );
+
+  await writeSeedMarker();
 }
 
 main()

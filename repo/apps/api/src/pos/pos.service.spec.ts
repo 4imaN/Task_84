@@ -28,27 +28,33 @@ describe('PosService', () => {
   });
 
   it('stores a fresh review snapshot before checkout', async () => {
-    databaseService.query
-      .mockResolvedValueOnce(queryResult([{ id: 'cart-1', status: 'OPEN' }]))
-      .mockResolvedValueOnce(
-        queryResult([
-          {
-            cart_item_id: 'line-1',
-            inventory_item_id: 'inventory-1',
-            sku: 'SKU-BKMK-01',
-            name: 'Archive Atlas Bookmark',
-            quantity: 2,
-            price_cents: 399,
-            on_hand: 40,
-            freight_cents: 20,
-            surcharge_cents: 10,
-            moving_average_cost_cents: 90,
-          },
-        ]),
-      )
-      .mockResolvedValueOnce(queryResult([]))
-      .mockResolvedValueOnce(queryResult([]))
-      .mockResolvedValueOnce(queryResult([{ reviewed_at: '2026-03-28T12:00:00.000Z' }]));
+    const transactionClient = {
+      query: jest
+        .fn()
+        .mockResolvedValueOnce(queryResult([{ id: 'cart-1', status: 'OPEN' }]))
+        .mockResolvedValueOnce(
+          queryResult([
+            {
+              cart_item_id: 'line-1',
+              inventory_item_id: 'inventory-1',
+              sku: 'SKU-BKMK-01',
+              name: 'Archive Atlas Bookmark',
+              quantity: 2,
+              price_cents: 399,
+              on_hand: 40,
+              freight_cents: 20,
+              surcharge_cents: 10,
+              moving_average_cost_cents: 90,
+            },
+          ]),
+        )
+        .mockResolvedValueOnce(queryResult([]))
+        .mockResolvedValueOnce(queryResult([]))
+        .mockResolvedValueOnce(queryResult([{ reviewed_at: '2026-03-28T12:00:00.000Z' }])),
+    };
+    databaseService.withTransaction.mockImplementation(
+      async (runner: (client: typeof transactionClient) => Promise<unknown>) => runner(transactionClient),
+    );
     auditService.write.mockResolvedValue(undefined);
 
     const result = await service.reviewTotal(
@@ -64,7 +70,7 @@ describe('PosService', () => {
 
     expect(result.reviewReady).toBe(true);
     expect(result.total).toBeGreaterThan(0);
-    expect(databaseService.query).toHaveBeenCalledWith(
+    expect(transactionClient.query).toHaveBeenCalledWith(
       expect.stringContaining('SET review_signature = $2'),
       expect.arrayContaining(['cart-1', 'review-signature']),
     );
@@ -84,7 +90,6 @@ describe('PosService', () => {
           ]),
         ),
     };
-    databaseService.query.mockResolvedValueOnce(queryResult([{ id: 'cart-1', status: 'OPEN' }]));
     databaseService.withTransaction.mockImplementation(async (runner: (client: typeof transactionClient) => Promise<unknown>) =>
       runner(transactionClient),
     );

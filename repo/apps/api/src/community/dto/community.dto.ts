@@ -1,56 +1,51 @@
-import { Transform, Type } from 'class-transformer';
+import { Type } from 'class-transformer';
 import {
   IsBoolean,
   IsIn,
   IsInt,
-  IsNotEmpty,
   IsOptional,
   IsString,
   IsUUID,
-  Matches,
   Max,
   MaxLength,
   Min,
 } from 'class-validator';
+import { NonBlankString, TrimmedString } from '../../common/validation';
 
 export class CreateCommentDto {
   @IsUUID()
+  @TrimmedString()
   titleId!: string;
 
   @IsOptional()
   @IsUUID()
+  @TrimmedString()
   parentCommentId?: string;
 
   @IsString()
   @IsIn(['COMMENT', 'QUESTION'])
   commentType!: 'COMMENT' | 'QUESTION';
 
-  @IsString()
+  @NonBlankString('body')
   @MaxLength(1000)
   body!: string;
 }
 
 export class CreateReportDto {
   @IsUUID()
-  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @TrimmedString()
   commentId!: string;
 
-  @IsString()
-  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
-  @IsNotEmpty()
-  @Matches(/\S/, { message: 'category should not be empty.' })
+  @NonBlankString('category')
   category!: string;
 
-  @IsString()
-  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
-  @IsNotEmpty()
-  @Matches(/\S/, { message: 'notes should not be empty.' })
+  @NonBlankString('notes')
   notes!: string;
 }
 
 export class RelationshipDto {
   @IsUUID()
-  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @TrimmedString()
   targetUserId!: string;
 
   @Type(() => Boolean)
@@ -60,6 +55,7 @@ export class RelationshipDto {
 
 export class RatingDto {
   @IsUUID()
+  @TrimmedString()
   titleId!: string;
 
   @Type(() => Number)
@@ -71,6 +67,7 @@ export class RatingDto {
 
 export class FavoriteDto {
   @IsUUID()
+  @TrimmedString()
   titleId!: string;
 
   @Type(() => Boolean)
@@ -80,6 +77,7 @@ export class FavoriteDto {
 
 export class SubscribeDto {
   @IsUUID()
+  @TrimmedString()
   targetId!: string;
 
   @Type(() => Boolean)

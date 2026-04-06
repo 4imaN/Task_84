@@ -1,4 +1,10 @@
-import { ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  ForbiddenException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import type { SessionUser } from '@ledgerread/contracts';
 import { AuditService } from '../audit/audit.service';
 import { DatabaseService, type Queryable } from '../database/database.service';
@@ -7,6 +13,7 @@ import type { ModerationActionDto } from './dto/moderation.dto';
 @Injectable()
 export class ModerationService {
   private readonly logger = new Logger(ModerationService.name);
+  private readonly suspendableRoles = new Set(['CUSTOMER']);
 
   constructor(
     private readonly databaseService: DatabaseService,
@@ -80,17 +87,22 @@ export class ModerationService {
 
   private async resolveTargets(input: ModerationActionDto, queryable: Queryable) {
     let reportId = input.reportId ?? null;
+    let reportCommentId: string | null = null;
+    let reportStatus: string | null = null;
     let targetCommentId = input.targetCommentId ?? null;
     let targetUserId = input.targetUserId ?? null;
+    let targetUserRole: string | null = null;
 
     if (reportId) {
       const report = await queryable.query<{
         id: string;
+        status: string;
         comment_id: string | null;
         comment_author_id: string | null;
       }>(
         `
         SELECT reports.id,
+               reports.status,
                reports.comment_id,
                comments.user_id AS comment_author_id
         FROM reports
@@ -105,6 +117,9 @@ export class ModerationService {
       if (!reportRow) {
         throw new NotFoundException('Report not found.');
       }
+
+      reportStatus = reportRow.status;
+      reportCommentId = reportRow.comment_id;
 
       if (targetCommentId && reportRow.comment_id && targetCommentId !== reportRow.comment_id) {
         throw new ConflictException('reportId does not match the supplied targetCommentId.');
@@ -145,9 +160,9 @@ export class ModerationService {
     }
 
     if (targetUserId) {
-      const targetUser = await queryable.query<{ id: string }>(
+      const targetUser = await queryable.query<{ id: string; role: string }>(
         `
-        SELECT id
+        SELECT id, role
         FROM users
         WHERE id = $1
         FOR UPDATE
@@ -158,25 +173,62 @@ export class ModerationService {
       if (!targetUser.rows[0]) {
         throw new NotFoundException('Target user not found.');
       }
+
+      targetUserRole = targetUser.rows[0].role;
     }
 
     return {
       reportId,
+      reportCommentId,
+      reportStatus,
       targetCommentId,
       targetUserId,
+      targetUserRole,
     };
   }
 
   async applyAction(user: SessionUser, traceId: string, input: ModerationActionDto) {
     return this.databaseService.withTransaction(async (client) => {
       const resolved = await this.resolveTargets(input, client);
+      const actionLabel = input.action.charAt(0).toUpperCase() + input.action.slice(1);
+
+      if ((input.action === 'hide' || input.action === 'restore' || input.action === 'remove') && !resolved.reportId) {
+        throw new ConflictException(`${actionLabel} requires a linked moderation report.`);
+      }
+
+      if (
+        (input.action === 'hide' || input.action === 'restore' || input.action === 'remove') &&
+        !resolved.reportCommentId
+      ) {
+        throw new ConflictException(`${actionLabel} requires a report linked to a comment target.`);
+      }
 
       if (!resolved.targetCommentId && input.action !== 'suspend') {
         throw new ConflictException('A targetCommentId is required for this moderation action.');
       }
 
+      if (input.action === 'suspend' && !resolved.reportId) {
+        throw new ConflictException('Suspend requires a linked moderation report.');
+      }
+
+      if (input.action === 'suspend' && resolved.reportStatus !== 'OPEN') {
+        throw new ConflictException('Suspend requires an OPEN moderation report.');
+      }
+
+      if (input.action === 'suspend' && !resolved.targetCommentId) {
+        throw new ConflictException('Suspend requires a report linked to a comment target.');
+      }
+
       if (input.action === 'suspend' && !resolved.targetUserId) {
         throw new ConflictException('Suspend requires a resolvable user target.');
+      }
+
+      if (
+        input.action === 'suspend' &&
+        resolved.targetUserRole &&
+        !this.suspendableRoles.has(resolved.targetUserRole)
+      ) {
+        throw new ForbiddenException('Moderation suspend can target customer accounts only.');
       }
 
       if (input.action === 'hide' && resolved.targetCommentId) {

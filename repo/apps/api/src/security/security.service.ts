@@ -1,12 +1,29 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import type { AppConfig } from '../config/app-config';
 import {
   createIdentifierLookupHash,
   decryptAtRestValue,
   encryptAtRestValue,
 } from './identifier';
+
+const canonicalizeForHash = (value: unknown): unknown => {
+  if (Array.isArray(value)) {
+    return value.map((entry) => canonicalizeForHash(entry));
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .reduce<Record<string, unknown>>((accumulator, [key, entryValue]) => {
+        accumulator[key] = canonicalizeForHash(entryValue);
+        return accumulator;
+      }, {});
+  }
+
+  return value;
+};
 
 @Injectable()
 export class SecurityService {
@@ -42,7 +59,29 @@ export class SecurityService {
 
   hashChain(payload: unknown, previousHash: string | null) {
     return createHash('sha256')
-      .update(JSON.stringify({ previousHash, payload }))
+      .update(
+        JSON.stringify(
+          canonicalizeForHash({
+            previousHash,
+            payload,
+          }),
+        ),
+      )
+      .digest('hex');
+  }
+
+  signChain(recordType: string, payload: unknown, previousHash: string | null, currentHash: string) {
+    return createHmac('sha256', this.rawKey)
+      .update(
+        JSON.stringify(
+          canonicalizeForHash({
+            recordType,
+            previousHash,
+            currentHash,
+            payload,
+          }),
+        ),
+      )
       .digest('hex');
   }
 }

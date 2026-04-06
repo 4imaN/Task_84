@@ -57,9 +57,10 @@ export function ReaderContentPanel({
         )}
 
         <div
+          data-testid="reader-content-surface"
           className={clsx('rounded-[2rem] px-4 py-2', readerSurfaceClass)}
           style={{
-            fontSize: `${activePreferences.fontSize}px`,
+            fontSize: `${activePreferences.fontSize}pt`,
             lineHeight: String(activePreferences.lineSpacing),
             fontFamily: getFontFamily(activePreferences.fontFamily),
           }}

@@ -58,6 +58,7 @@ run_api() {
     -e APP_BASE_URL=http://localhost:4000 \
     -e SESSION_TTL_MINUTES=30 \
     -e EVIDENCE_STORAGE_ROOT=/tmp/ledgerread-evidence \
+    -e ATTENDANCE_EVIDENCE_MAX_BYTES=5242880 \
     app npm run test:api:local
 }
 

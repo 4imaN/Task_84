@@ -24,6 +24,8 @@ const run = (command, args, env = process.env) =>
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const runtimeKeyFile = resolve('.ledgerread-runtime/app_encryption_key');
+const DEFAULT_ADMIN_DATABASE_URL = 'postgresql://postgres:postgres@localhost:5432/ledgerread';
+const DEFAULT_APP_DATABASE_URL = 'postgresql://ledgerread_app:ledgerread_app@localhost:5432/ledgerread';
 
 const resolveEncryptionKey = async () => {
   if (process.env.APP_ENCRYPTION_KEY?.trim()) {
@@ -37,6 +39,17 @@ const resolveEncryptionKey = async () => {
     await mkdir(dirname(runtimeKeyFile), { recursive: true });
     await writeFile(runtimeKeyFile, generated, 'utf8');
     return generated;
+  }
+};
+
+const deriveAppDatabaseUrl = (adminDatabaseUrl) => {
+  try {
+    const parsed = new URL(adminDatabaseUrl);
+    parsed.username = 'ledgerread_app';
+    parsed.password = 'ledgerread_app';
+    return parsed.toString();
+  } catch {
+    return DEFAULT_APP_DATABASE_URL;
   }
 };
 
@@ -66,21 +79,35 @@ const waitForPostgres = async () => {
 };
 
 try {
-  const env = {
+  const adminDatabaseUrl =
+    process.env.DATABASE_ADMIN_URL ?? process.env.DATABASE_URL ?? DEFAULT_ADMIN_DATABASE_URL;
+  const appDatabaseUrl = process.env.APP_DATABASE_URL ?? deriveAppDatabaseUrl(adminDatabaseUrl);
+
+  const baseEnv = {
     ...process.env,
-    DATABASE_URL: process.env.DATABASE_URL ?? 'postgresql://postgres:postgres@localhost:5432/ledgerread',
+    DATABASE_ADMIN_URL: adminDatabaseUrl,
+    APP_DATABASE_URL: appDatabaseUrl,
     APP_ENCRYPTION_KEY: await resolveEncryptionKey(),
     SESSION_TTL_MINUTES: process.env.SESSION_TTL_MINUTES ?? '30',
     APP_BASE_URL: process.env.APP_BASE_URL ?? 'http://localhost:4000',
     EVIDENCE_STORAGE_ROOT: process.env.EVIDENCE_STORAGE_ROOT ?? '/tmp/ledgerread-evidence',
+    ATTENDANCE_EVIDENCE_MAX_BYTES: process.env.ATTENDANCE_EVIDENCE_MAX_BYTES ?? '5242880',
+  };
+  const migrationEnv = {
+    ...baseEnv,
+    DATABASE_URL: adminDatabaseUrl,
+  };
+  const testEnv = {
+    ...baseEnv,
+    DATABASE_URL: appDatabaseUrl,
   };
   await run('docker', ['compose', 'up', '-d', 'postgres']);
   await waitForPostgres();
-  await resetDatabase(env.DATABASE_URL);
-  await run('npm', ['run', 'build:shared'], env);
-  await run('npm', ['run', 'migrate', '-w', '@ledgerread/api'], env);
-  await run('npm', ['run', 'seed', '-w', '@ledgerread/api'], env);
-  await run('npm', ['run', 'test', '-w', '@ledgerread/api'], env);
+  await resetDatabase(adminDatabaseUrl);
+  await run('npm', ['run', 'build:shared'], migrationEnv);
+  await run('npm', ['run', 'migrate', '-w', '@ledgerread/api'], migrationEnv);
+  await run('npm', ['run', 'seed', '-w', '@ledgerread/api'], migrationEnv);
+  await run('npm', ['run', 'test', '-w', '@ledgerread/api'], testEnv);
 } catch (error) {
   console.error(error instanceof Error ? error.message : error);
   process.exitCode = 1;

@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 
-const DEFAULT_DATABASE_URL = 'postgresql://postgres:postgres@localhost:5432/ledgerread';
+const DEFAULT_ADMIN_DATABASE_URL = 'postgresql://postgres:postgres@localhost:5432/ledgerread';
+const DEFAULT_APP_DATABASE_URL = 'postgresql://ledgerread_app:ledgerread_app@localhost:5432/ledgerread';
 
 const run = (command, args, env = process.env) =>
   new Promise((resolve, reject) => {
@@ -31,6 +32,17 @@ const resetDatabase = async (connectionString) => {
     await client.query('CREATE SCHEMA public');
   } finally {
     await client.end();
+  }
+};
+
+const deriveAppDatabaseUrl = (adminDatabaseUrl) => {
+  try {
+    const parsed = new URL(adminDatabaseUrl);
+    parsed.username = 'ledgerread_app';
+    parsed.password = 'ledgerread_app';
+    return parsed.toString();
+  } catch {
+    return DEFAULT_APP_DATABASE_URL;
   }
 };
 
@@ -99,24 +111,38 @@ try {
 
   const port = process.env.PORT?.trim() || '4100';
   const baseUrl = process.env.APP_BASE_URL?.trim() || `http://localhost:${port}`;
-  const env = {
+  const adminDatabaseUrl =
+    process.env.DATABASE_ADMIN_URL ?? process.env.DATABASE_URL ?? DEFAULT_ADMIN_DATABASE_URL;
+  const appDatabaseUrl = process.env.APP_DATABASE_URL ?? deriveAppDatabaseUrl(adminDatabaseUrl);
+
+  const baseEnv = {
     ...process.env,
     APP_ENCRYPTION_KEY: encryptionKey,
-    DATABASE_URL: process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL,
+    DATABASE_ADMIN_URL: adminDatabaseUrl,
+    APP_DATABASE_URL: appDatabaseUrl,
     PORT: port,
     APP_BASE_URL: baseUrl,
     SESSION_TTL_MINUTES: process.env.SESSION_TTL_MINUTES ?? '30',
     EVIDENCE_STORAGE_ROOT: process.env.EVIDENCE_STORAGE_ROOT ?? '/tmp/ledgerread-evidence',
+    ATTENDANCE_EVIDENCE_MAX_BYTES: process.env.ATTENDANCE_EVIDENCE_MAX_BYTES ?? '5242880',
+  };
+  const migrationEnv = {
+    ...baseEnv,
+    DATABASE_URL: adminDatabaseUrl,
+  };
+  const runtimeEnv = {
+    ...baseEnv,
+    DATABASE_URL: appDatabaseUrl,
   };
 
-  await resetDatabase(env.DATABASE_URL);
-  await run('npm', ['run', 'build:api'], env);
-  await run('npm', ['run', 'migrate', '-w', '@ledgerread/api'], env);
-  await run('npm', ['run', 'seed', '-w', '@ledgerread/api'], env);
+  await resetDatabase(adminDatabaseUrl);
+  await run('npm', ['run', 'build:api'], migrationEnv);
+  await run('npm', ['run', 'migrate', '-w', '@ledgerread/api'], migrationEnv);
+  await run('npm', ['run', 'seed', '-w', '@ledgerread/api'], migrationEnv);
 
   const serverProcess = spawn('npm', ['run', 'start', '-w', '@ledgerread/api'], {
     stdio: 'inherit',
-    env,
+    env: runtimeEnv,
     shell: false,
   });
 

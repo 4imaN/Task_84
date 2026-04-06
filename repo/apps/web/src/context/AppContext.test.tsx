@@ -24,6 +24,7 @@ const inventorySession: AppSession = {
     workspace: 'admin',
   },
   homePath: '/admin/overview',
+  csrfToken: 'csrf-inventory-1',
 };
 
 const managerSession: AppSession = {
@@ -34,6 +35,7 @@ const managerSession: AppSession = {
     workspace: 'admin',
   },
   homePath: '/admin/overview',
+  csrfToken: 'csrf-manager-1',
 };
 
 function Harness() {

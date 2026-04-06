@@ -1,11 +1,11 @@
-import { IsISO8601, IsOptional, IsString } from 'class-validator';
+import { IsISO8601, IsOptional } from 'class-validator';
+import { NonBlankString } from '../../common/validation';
 
 export class AttendanceDto {
   @IsISO8601()
   occurredAt!: string;
 
   @IsOptional()
-  @IsString()
+  @NonBlankString('expectedChecksum')
   expectedChecksum?: string;
 }
-

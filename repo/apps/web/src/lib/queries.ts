@@ -6,6 +6,7 @@ export const catalogQuery = `
         slug
         name
         format
+        isReadable
         price
         inventoryOnHand
         authorName
@@ -18,6 +19,7 @@ export const catalogQuery = `
         slug
         name
         format
+        isReadable
         price
         inventoryOnHand
         authorName
@@ -36,6 +38,7 @@ export const titleQuery = `
       slug
       name
       format
+      isReadable
       price
       inventoryOnHand
       authorName

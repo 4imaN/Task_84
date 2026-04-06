@@ -5,11 +5,6 @@ import { apiRequest } from '../../lib/api';
 import { currency, formatReadableDateTime, isDateLikeKey } from '../../lib/format';
 import type { AuditLog, AuditPayloadValue } from '../../lib/types';
 
-const SENSITIVE_AUDIT_KEY_PATTERN =
-  /(signature|hash|cipher|token|password|secret|note|notes|body|fingerprint)/i;
-const SAFE_AUDIT_KEY_PATTERN =
-  /(Id|At|sku|quantity|availableQuantity|requestedQuantity|rating|active|category|commentType|paymentMethod|deviceLabel|resolution|status|total|subtotal|discount|fee|price|amount|method)/i;
-
 const toAuditLabel = (key: string) =>
   key
     .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
@@ -43,21 +38,13 @@ export function AuditPage() {
     return String(value);
   };
 
-  const getPayloadSummary = (payload: Record<string, unknown>) => {
+  const getPayloadSummary = (
+    payload: Record<string, string | number | boolean | null>,
+    redactedFields: number,
+  ) => {
     const safeEntries: AuditPayloadValue[] = [];
-    let redactedCount = 0;
 
     for (const [key, value] of Object.entries(payload)) {
-      if (SENSITIVE_AUDIT_KEY_PATTERN.test(key)) {
-        redactedCount += 1;
-        continue;
-      }
-
-      if (!SAFE_AUDIT_KEY_PATTERN.test(key) && !isDateLikeKey(key)) {
-        redactedCount += 1;
-        continue;
-      }
-
       safeEntries.push({
         key,
         label: toAuditLabel(key),
@@ -67,7 +54,7 @@ export function AuditPage() {
 
     return {
       safeEntries,
-      redactedCount,
+      redactedCount: redactedFields,
     };
   };
 
@@ -86,7 +73,7 @@ export function AuditPage() {
         {(auditLogs.data ?? []).map((log) => (
           <article key={log.id} className="shell-panel p-5">
             {(() => {
-              const payloadSummary = getPayloadSummary(log.payload);
+              const payloadSummary = getPayloadSummary(log.payload, log.redacted_fields);
 
               return (
                 <>

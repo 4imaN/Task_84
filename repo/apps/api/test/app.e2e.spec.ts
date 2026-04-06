@@ -1,9 +1,14 @@
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import * as argon2 from 'argon2';
+import { spawn } from 'node:child_process';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
+import { resolve } from 'node:path';
 import { Pool } from 'pg';
 import request from 'supertest';
 import { AppModule } from '../src/app.module';
+import { MAX_AUDIT_LOG_LIMIT } from '../src/admin/dto/admin.dto';
+import { DEFAULT_ATTENDANCE_EVIDENCE_MAX_BYTES } from '../src/config/app-config';
 import {
   createIdentifierLookupHash,
   decryptAtRestValue,
@@ -11,6 +16,10 @@ import {
 } from '../src/security/identifier';
 
 const GRAPHQL = '/graphql';
+const APP_ORIGIN = process.env.APP_BASE_URL ?? 'http://localhost:4000';
+const CONFIGURED_LAN_ORIGIN = 'http://192.168.50.20:4173';
+const DEFAULT_ADMIN_DATABASE_URL = 'postgresql://postgres:postgres@localhost:5432/ledgerread';
+const DEFAULT_APP_DATABASE_URL = 'postgresql://ledgerread_app:ledgerread_app@localhost:5432/ledgerread';
 const VALID_PNG = Buffer.from([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
   0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
@@ -22,11 +31,91 @@ const VALID_PNG = Buffer.from([
   0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
   0x42, 0x60, 0x82,
 ]);
+const checksumOf = (buffer: Buffer) => createHash('sha256').update(buffer).digest('hex');
+const canonicalizeForHash = (value: unknown): unknown => {
+  if (Array.isArray(value)) {
+    return value.map((entry) => canonicalizeForHash(entry));
+  }
 
-describe('LedgerRead API', () => {
+  if (value && typeof value === 'object') {
+    return Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .reduce<Record<string, unknown>>((accumulator, [key, entryValue]) => {
+        accumulator[key] = canonicalizeForHash(entryValue);
+        return accumulator;
+      }, {});
+  }
+
+  return value;
+};
+const chainHash = (payload: unknown, previousHash: string | null) =>
+  createHash('sha256')
+    .update(
+      JSON.stringify(
+        canonicalizeForHash({
+          previousHash,
+          payload,
+        }),
+      ),
+    )
+    .digest('hex');
+const chainSignature = (
+  recordType: 'audit' | 'attendance',
+  payload: unknown,
+  previousHash: string | null,
+  currentHash: string,
+) => {
+  const key = process.env.APP_ENCRYPTION_KEY?.trim();
+  if (!key) {
+    throw new Error('APP_ENCRYPTION_KEY is required for API integration tests.');
+  }
+
+  return createHmac('sha256', key)
+  .update(
+    JSON.stringify(
+      canonicalizeForHash({
+        recordType,
+        previousHash,
+        currentHash,
+        payload,
+      }),
+    ),
+  )
+  .digest('hex');
+};
+
+const deriveRuntimeDatabaseUrl = (adminDatabaseUrl: string) => {
+  try {
+    const parsed = new URL(adminDatabaseUrl);
+    parsed.username = 'ledgerread_app';
+    parsed.password = 'ledgerread_app';
+    return parsed.toString();
+  } catch {
+    return DEFAULT_APP_DATABASE_URL;
+  }
+};
+
+describe('LedgerRead API (auth-admin)', () => {
   let app: INestApplication;
   let agent: ReturnType<typeof request>;
   let pool: Pool;
+  let runtimePool: Pool | null = null;
+  let originalAllowedOriginsEnv: string | undefined;
+
+  const createAuthenticatedAgent = (
+    sessionAgent: ReturnType<typeof request.agent>,
+    csrfToken: string,
+  ) => ({
+    get: (url: string) => sessionAgent.get(url),
+    post: (url: string) =>
+      sessionAgent.post(url).set('x-csrf-token', csrfToken).set('Origin', APP_ORIGIN),
+    put: (url: string) =>
+      sessionAgent.put(url).set('x-csrf-token', csrfToken).set('Origin', APP_ORIGIN),
+    patch: (url: string) =>
+      sessionAgent.patch(url).set('x-csrf-token', csrfToken).set('Origin', APP_ORIGIN),
+    delete: (url: string) =>
+      sessionAgent.delete(url).set('x-csrf-token', csrfToken).set('Origin', APP_ORIGIN),
+  });
 
   const usernameHash = (username: string) => {
     const key = process.env.APP_ENCRYPTION_KEY?.trim();
@@ -105,10 +194,98 @@ describe('LedgerRead API', () => {
     return result.rows[0]!.id;
   };
 
-  beforeAll(async () => {
-    pool = new Pool({
-      connectionString: process.env.DATABASE_URL ?? 'postgresql://postgres:postgres@localhost:5432/ledgerread',
+  const issueSessionToken = async (input: {
+    userId: string;
+    workspace: 'app' | 'pos' | 'mod' | 'admin' | 'finance';
+    token?: string;
+  }) => {
+    const token = input.token ?? `session-token-${Date.now()}-${Math.random()}`;
+    await pool.query(
+      `
+      INSERT INTO sessions (user_id, token_hash, workspace, last_activity_at, expires_at)
+      VALUES ($1, $2, $3, NOW(), NOW() + INTERVAL '30 minutes')
+      `,
+      [input.userId, createHash('sha256').update(token).digest('hex'), input.workspace],
+    );
+
+    return token;
+  };
+
+  const spawnSeedScript = async (options?: {
+    reset?: boolean;
+    nodeEnv?: string;
+    allowDestructiveResetInProduction?: boolean;
+  }) => {
+    const apiRoot = resolve(__dirname, '..');
+    const adminDatabaseUrl =
+      process.env.DATABASE_ADMIN_URL ?? process.env.DATABASE_URL ?? DEFAULT_ADMIN_DATABASE_URL;
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      DATABASE_URL: adminDatabaseUrl,
+      DATABASE_ADMIN_URL: adminDatabaseUrl,
+      APP_ENCRYPTION_KEY: encryptionKey(),
+      NODE_ENV: options?.nodeEnv ?? process.env.NODE_ENV ?? 'test',
+    };
+
+    if (options?.reset) {
+      env.LEDGERREAD_SEED_RESET = '1';
+    } else {
+      delete env.LEDGERREAD_SEED_RESET;
+    }
+
+    if (options?.allowDestructiveResetInProduction) {
+      env.LEDGERREAD_ALLOW_DESTRUCTIVE_SEED_IN_PRODUCTION = '1';
+    } else {
+      delete env.LEDGERREAD_ALLOW_DESTRUCTIVE_SEED_IN_PRODUCTION;
+    }
+
+    return await new Promise<{ code: number; stdout: string; stderr: string }>((resolveSeed) => {
+      const child = spawn('npm', ['run', 'seed'], {
+        cwd: apiRoot,
+        env,
+        shell: false,
+      });
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout.on('data', (chunk) => {
+        stdout += chunk.toString();
+      });
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk.toString();
+      });
+      child.on('exit', (code) => {
+        resolveSeed({
+          code: code ?? 1,
+          stdout,
+          stderr,
+        });
+      });
     });
+  };
+
+  beforeAll(async () => {
+    originalAllowedOriginsEnv = process.env.APP_ALLOWED_ORIGINS;
+    const allowedOrigins = new Set(
+      (process.env.APP_ALLOWED_ORIGINS ?? '')
+        .split(',')
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0),
+    );
+    allowedOrigins.add(CONFIGURED_LAN_ORIGIN);
+    process.env.APP_ALLOWED_ORIGINS = Array.from(allowedOrigins).join(',');
+
+    const adminDatabaseUrl =
+      process.env.DATABASE_ADMIN_URL ?? process.env.DATABASE_URL ?? DEFAULT_ADMIN_DATABASE_URL;
+    const appDatabaseUrl = process.env.APP_DATABASE_URL ?? deriveRuntimeDatabaseUrl(adminDatabaseUrl);
+
+    pool = new Pool({
+      connectionString: adminDatabaseUrl,
+    });
+    runtimePool = new Pool({
+      connectionString: appDatabaseUrl,
+    });
+    await runtimePool.query('SELECT 1');
 
     const moduleRef = await Test.createTestingModule({
       imports: [AppModule],
@@ -182,27 +359,43 @@ describe('LedgerRead API', () => {
     if (app) {
       await app.close();
     }
+    if (runtimePool) {
+      await runtimePool.end();
+    }
     await pool.end();
+
+    if (originalAllowedOriginsEnv === undefined) {
+      delete process.env.APP_ALLOWED_ORIGINS;
+    } else {
+      process.env.APP_ALLOWED_ORIGINS = originalAllowedOriginsEnv;
+    }
   });
 
   const login = async (username: string, password: string, workspace: string) => {
     const sessionAgent = request.agent(app.getHttpServer());
-    const response = await sessionAgent.post('/auth/login').send({ username, password, workspace }).expect(201);
+    const response = await sessionAgent
+      .post('/auth/login')
+      .set('Origin', APP_ORIGIN)
+      .send({ username, password, workspace })
+      .expect(201);
+    const csrfToken = response.body.csrfToken as string;
     return {
-      agent: sessionAgent,
+      agent: createAuthenticatedAgent(sessionAgent, csrfToken),
+      rawAgent: sessionAgent,
+      csrfToken,
       user: response.body.user as { id: string; username: string; role: string; workspace: string },
       homePath: response.body.homePath as string,
     } satisfies {
-      agent: ReturnType<typeof request.agent>;
+      agent: ReturnType<typeof createAuthenticatedAgent>;
+      rawAgent: ReturnType<typeof request.agent>;
+      csrfToken: string;
       user: { id: string; username: string; role: string; workspace: string };
       homePath: string;
     };
   };
 
-  const authHeader = (token: string) => ({ Authorization: `Bearer ${token}` });
-
   const graphql = async <T = unknown>(
-    sessionAgent: ReturnType<typeof request.agent>,
+    sessionAgent: ReturnType<typeof createAuthenticatedAgent>,
     query: string,
     variables?: Record<string, unknown>,
   ) => {
@@ -217,8 +410,441 @@ describe('LedgerRead API', () => {
     return response.body.data as T;
   };
 
+  const graphqlResponse = async (
+    sessionAgent: ReturnType<typeof createAuthenticatedAgent>,
+    query: string,
+    variables?: Record<string, unknown>,
+  ) =>
+    sessionAgent
+      .post(GRAPHQL)
+      .send({
+        query,
+        variables,
+      })
+      .expect(200);
+
   it('rejects unauthenticated session access with 401', async () => {
     await agent.get('/auth/session').expect(401);
+  });
+
+  it('rejects cross-origin login attempts and preserves same-origin login behavior', async () => {
+    await agent
+      .post('/auth/login')
+      .set('Origin', 'http://evil.example')
+      .send({ username: 'reader.ada', password: 'Reader!2026', workspace: 'app' })
+      .expect(403)
+      .expect(({ body }) => {
+        expect(body.message).toBe('Request origin is not allowed for login.');
+      });
+
+    await agent
+      .post('/auth/login')
+      .set('Origin', 'http://192.168.50.30:4000')
+      .set('Host', 'localhost:4000')
+      .set('x-forwarded-host', '192.168.50.30:4000')
+      .send({ username: 'reader.ada', password: 'Reader!2026', workspace: 'app' })
+      .expect(403)
+      .expect(({ body }) => {
+        expect(body.message).toBe('Request origin is not allowed for login.');
+      });
+
+    await agent
+      .post('/auth/login')
+      .send({ username: 'reader.ada', password: 'Reader!2026', workspace: 'app' })
+      .expect(403)
+      .expect(({ body }) => {
+        expect(body.message).toBe('Request origin is required for login.');
+      });
+
+    const sameOriginSession = request.agent(app.getHttpServer());
+    const sameOriginLogin = await sameOriginSession
+      .post('/auth/login')
+      .set('Origin', APP_ORIGIN)
+      .send({ username: 'reader.ada', password: 'Reader!2026', workspace: 'app' })
+      .expect(201);
+    await sameOriginSession
+      .post('/auth/logout')
+      .set('Origin', APP_ORIGIN)
+      .set('x-csrf-token', sameOriginLogin.body.csrfToken as string)
+      .expect(201);
+  });
+
+  it('rejects cookie-authenticated mutations without a valid CSRF token or allowed origin', async () => {
+    const clerk = await login('clerk.emma', 'Clerk!2026', 'pos');
+    const occurredAt = new Date().toISOString();
+
+    await clerk.rawAgent
+      .post('/attendance/clock-in')
+      .field('occurredAt', occurredAt)
+      .expect(403)
+      .expect(({ body }) => {
+        expect(body.message).toBe('CSRF protection token is missing or invalid.');
+      });
+
+    await clerk.rawAgent
+      .post('/attendance/clock-in')
+      .set('x-csrf-token', 'invalid-csrf-token')
+      .set('Origin', APP_ORIGIN)
+      .field('occurredAt', occurredAt)
+      .expect(403)
+      .expect(({ body }) => {
+        expect(body.message).toBe('CSRF protection token is missing or invalid.');
+      });
+
+    await clerk.rawAgent
+      .post('/attendance/clock-in')
+      .set('x-csrf-token', clerk.csrfToken)
+      .set('Origin', 'http://evil.example')
+      .field('occurredAt', occurredAt)
+      .expect(403)
+      .expect(({ body }) => {
+        expect(body.message).toBe('Request origin is not allowed for authenticated mutations.');
+      });
+
+    await clerk.rawAgent
+      .post('/attendance/clock-in')
+      .set('x-csrf-token', clerk.csrfToken)
+      .set('Origin', CONFIGURED_LAN_ORIGIN)
+      .field('occurredAt', new Date().toISOString())
+      .expect(201);
+
+    await clerk.rawAgent
+      .post('/attendance/clock-in')
+      .set('x-csrf-token', clerk.csrfToken)
+      .set('Origin', 'http://192.168.50.30:4000')
+      .set('Host', '192.168.50.30:4000')
+      .field('occurredAt', new Date().toISOString())
+      .expect(201);
+
+    await clerk.agent
+      .post('/attendance/clock-in')
+      .field('occurredAt', occurredAt)
+      .expect(201);
+
+    await clerk.agent.post('/auth/logout').expect(201);
+  });
+
+  it('enforces a server-side attendance timestamp skew window for client-provided occurredAt values', async () => {
+    const clerk = await login('clerk.emma', 'Clerk!2026', 'pos');
+    const tooOld = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const tooFuture = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+
+    await clerk.agent
+      .post('/attendance/clock-in')
+      .field('occurredAt', tooOld)
+      .expect(400)
+      .expect(({ body }) => {
+        expect(String(body.message)).toContain('within');
+      });
+
+    await clerk.agent
+      .post('/attendance/clock-in')
+      .field('occurredAt', tooFuture)
+      .expect(400)
+      .expect(({ body }) => {
+        expect(String(body.message)).toContain('within');
+      });
+
+    await clerk.agent.post('/auth/logout').expect(201);
+  });
+
+  it('chains server-authoritative attendance time while retaining client time as metadata', async () => {
+    const clerk = await login('clerk.emma', 'Clerk!2026', 'pos');
+    const clientOccurredAt = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+    const clockIn = await clerk.agent
+      .post('/attendance/clock-in')
+      .field('occurredAt', clientOccurredAt)
+      .expect(201);
+
+    const persisted = await pool.query<{
+      id: string;
+      user_id: string;
+      event_type: 'CLOCK_IN' | 'CLOCK_OUT';
+      occurred_at: string;
+      client_occurred_at: string | null;
+      evidence_checksum: string | null;
+      previous_hash: string | null;
+      current_hash: string;
+    }>(
+      `
+      SELECT id,
+             user_id,
+             event_type,
+             occurred_at,
+             client_occurred_at,
+             evidence_checksum,
+             previous_hash,
+             current_hash
+      FROM attendance_records
+      WHERE id = $1
+      `,
+      [clockIn.body.recordId],
+    );
+    const row = persisted.rows[0]!;
+
+    expect(row.client_occurred_at).not.toBeNull();
+    expect(Math.abs(new Date(row.client_occurred_at!).getTime() - new Date(clientOccurredAt).getTime())).toBeLessThan(
+      2_000,
+    );
+    expect(Math.abs(new Date(row.occurred_at).getTime() - Date.now())).toBeLessThan(20_000);
+    expect(Math.abs(new Date(row.occurred_at).getTime() - new Date(clientOccurredAt).getTime())).toBeGreaterThan(
+      30_000,
+    );
+
+    const authoritativePayload = {
+      userId: row.user_id,
+      eventType: row.event_type,
+      occurredAt: new Date(row.occurred_at).toISOString(),
+      clientOccurredAt: new Date(row.client_occurred_at!).toISOString(),
+      evidenceChecksum: row.evidence_checksum,
+    };
+    expect(row.current_hash).toBe(chainHash(authoritativePayload, row.previous_hash));
+
+    const clientControlledPayload = {
+      userId: row.user_id,
+      eventType: row.event_type,
+      occurredAt: new Date(row.client_occurred_at!).toISOString(),
+      evidenceChecksum: row.evidence_checksum,
+    };
+    expect(row.current_hash).not.toBe(chainHash(clientControlledPayload, row.previous_hash));
+
+    await clerk.agent
+      .post('/attendance/clock-out')
+      .field('occurredAt', new Date().toISOString())
+      .expect(201);
+    await clerk.agent.post('/auth/logout').expect(201);
+  });
+
+  it('uses authoritative attendance timestamps (not client metadata) for overdue risk evaluation', async () => {
+    const clerk = await login('clerk.emma', 'Clerk!2026', 'pos');
+    const latestAttendance = await pool.query<{ current_hash: string }>(
+      'SELECT current_hash FROM attendance_records ORDER BY created_at DESC, id DESC LIMIT 1',
+    );
+
+    const authoritativeOccurredAt = new Date().toISOString();
+    const clientOccurredAt = new Date(Date.now() - 13 * 60 * 60 * 1000).toISOString();
+    const payload = {
+      userId: clerk.user.id,
+      eventType: 'CLOCK_IN',
+      occurredAt: authoritativeOccurredAt,
+      clientOccurredAt,
+      evidenceChecksum: null,
+    };
+    const currentHash = chainHash(payload, latestAttendance.rows[0]?.current_hash ?? null);
+    const signature = chainSignature(
+      'attendance',
+      payload,
+      latestAttendance.rows[0]?.current_hash ?? null,
+      currentHash,
+    );
+
+    const inserted = await pool.query<{ id: string }>(
+      `
+      INSERT INTO attendance_records (
+        user_id,
+        event_type,
+        occurred_at,
+        client_occurred_at,
+        evidence_path,
+        evidence_mime_type,
+        evidence_checksum,
+        previous_hash,
+        current_hash,
+        chain_signature,
+        created_at
+      )
+      VALUES ($1, $2, $3, $4, NULL, NULL, NULL, $5, $6, $7, NOW())
+      RETURNING id
+      `,
+      [
+        clerk.user.id,
+        'CLOCK_IN',
+        authoritativeOccurredAt,
+        clientOccurredAt,
+        latestAttendance.rows[0]?.current_hash ?? null,
+        currentHash,
+        signature,
+      ],
+    );
+
+    await clerk.agent.get('/attendance/risks').expect(200);
+
+    const relatedRisk = await pool.query<{ count: string }>(
+      `
+      SELECT COUNT(*)::text AS count
+      FROM risk_alerts
+      WHERE attendance_record_id = $1
+        AND description = 'Missing clock-out after 12 hours.'
+      `,
+      [inserted.rows[0]!.id],
+    );
+    expect(Number(relatedRisk.rows[0]!.count)).toBe(0);
+
+    await clerk.agent.post('/auth/logout').expect(201);
+  });
+
+  it('refreshes overdue attendance risks globally for manager views without waiting for cron', async () => {
+    const globalRiskClerkUsername = `clerk.global.${Date.now()}`;
+    const globalRiskClerkId = await ensureUser({
+      username: globalRiskClerkUsername,
+      password: 'GlobalRisk!2026',
+      displayName: 'Global Risk Clerk',
+      role: 'CLERK',
+      externalIdentifier: `EID-${Date.now()}`,
+    });
+    const manager = await login('manager.li', 'Manager!2026', 'admin');
+    const latestAttendance = await pool.query<{ current_hash: string }>(
+      'SELECT current_hash FROM attendance_records ORDER BY created_at DESC, id DESC LIMIT 1',
+    );
+
+    const overdueOccurredAt = new Date(Date.now() - 13 * 60 * 60 * 1000).toISOString();
+    const payload = {
+      userId: globalRiskClerkId,
+      eventType: 'CLOCK_IN',
+      occurredAt: overdueOccurredAt,
+      evidenceChecksum: null,
+    };
+    const currentHash = chainHash(payload, latestAttendance.rows[0]?.current_hash ?? null);
+    const signature = chainSignature(
+      'attendance',
+      payload,
+      latestAttendance.rows[0]?.current_hash ?? null,
+      currentHash,
+    );
+
+    const inserted = await pool.query<{ id: string }>(
+      `
+      INSERT INTO attendance_records (
+        user_id,
+        event_type,
+        occurred_at,
+        client_occurred_at,
+        evidence_path,
+        evidence_mime_type,
+        evidence_checksum,
+        previous_hash,
+        current_hash,
+        chain_signature,
+        created_at
+      )
+      VALUES ($1, $2, $3, $4, NULL, NULL, NULL, $5, $6, $7, NOW())
+      RETURNING id
+      `,
+      [
+        globalRiskClerkId,
+        'CLOCK_IN',
+        overdueOccurredAt,
+        overdueOccurredAt,
+        latestAttendance.rows[0]?.current_hash ?? null,
+        currentHash,
+        signature,
+      ],
+    );
+
+    await manager.agent.get('/attendance/risks').expect(200);
+
+    const relatedRisk = await pool.query<{ count: string }>(
+      `
+      SELECT COUNT(*)::text AS count
+      FROM risk_alerts
+      WHERE attendance_record_id = $1
+        AND description = 'Missing clock-out after 12 hours.'
+      `,
+      [inserted.rows[0]!.id],
+    );
+    expect(Number(relatedRisk.rows[0]!.count)).toBe(1);
+
+    await manager.agent.post('/auth/logout').expect(201);
+  });
+
+  it('enforces least-privilege role boundaries for attendance write and risk endpoints', async () => {
+    const clerk = await login('clerk.emma', 'Clerk!2026', 'pos');
+    const moderator = await login('mod.noah', 'Moderator!2026', 'mod');
+    const manager = await login('manager.li', 'Manager!2026', 'admin');
+    const finance = await login('finance.zoe', 'Finance!2026', 'finance');
+    const inventory = await login('inventory.ivan', 'Inventory!2026', 'admin');
+    const customer = await login('reader.ada', 'Reader!2026', 'app');
+
+    await clerk.agent
+      .post('/attendance/clock-in')
+      .field('occurredAt', new Date().toISOString())
+      .expect(201);
+    await clerk.agent
+      .post('/attendance/clock-out')
+      .field('occurredAt', new Date().toISOString())
+      .expect(201);
+
+    await moderator.agent
+      .post('/attendance/clock-in')
+      .field('occurredAt', new Date().toISOString())
+      .expect(403);
+    await manager.agent
+      .post('/attendance/clock-in')
+      .field('occurredAt', new Date().toISOString())
+      .expect(403);
+    await finance.agent
+      .post('/attendance/clock-in')
+      .field('occurredAt', new Date().toISOString())
+      .expect(403);
+    await inventory.agent
+      .post('/attendance/clock-in')
+      .field('occurredAt', new Date().toISOString())
+      .expect(403);
+    await customer.agent
+      .post('/attendance/clock-in')
+      .field('occurredAt', new Date().toISOString())
+      .expect(403);
+
+    await clerk.agent.get('/attendance/risks').expect(200);
+    await manager.agent.get('/attendance/risks').expect(200);
+    await finance.agent.get('/attendance/risks').expect(200);
+    await inventory.agent.get('/attendance/risks').expect(200);
+    await moderator.agent.get('/attendance/risks').expect(403);
+    await customer.agent.get('/attendance/risks').expect(403);
+
+    await clerk.agent.post('/auth/logout').expect(201);
+    await moderator.agent.post('/auth/logout').expect(201);
+    await manager.agent.post('/auth/logout').expect(201);
+    await finance.agent.post('/auth/logout').expect(201);
+    await inventory.agent.post('/auth/logout').expect(201);
+    await customer.agent.post('/auth/logout').expect(201);
+  });
+
+  it('rejects bearer-only authentication on browser-facing routes', async () => {
+    const clerkUserId = await findUserId('clerk.emma');
+    const bearerToken = await issueSessionToken({
+      userId: clerkUserId,
+      workspace: 'pos',
+    });
+
+    await agent
+      .get('/auth/session')
+      .set('Authorization', `Bearer ${bearerToken}`)
+      .expect(401)
+      .expect(({ body }) => {
+        expect(body.message).toBe('Authentication is required.');
+      });
+
+    await agent
+      .post('/attendance/clock-in')
+      .set('Authorization', `Bearer ${bearerToken}`)
+      .set('Origin', APP_ORIGIN)
+      .field('occurredAt', new Date().toISOString())
+      .expect(401)
+      .expect(({ body }) => {
+        expect(body.message).toBe('Authentication is required.');
+      });
+  });
+
+  it('treats malformed session cookie values as unauthenticated input', async () => {
+    const malformedCookie = 'ledgerread_session=%E0%A4%A';
+
+    await agent.get('/auth/session').set('Cookie', malformedCookie).expect(401);
+    await agent
+      .post('/attendance/clock-in')
+      .set('Cookie', malformedCookie)
+      .field('occurredAt', new Date().toISOString())
+      .expect(401);
   });
 
   it('restricts /profiles endpoints to customers and returns 403 for other roles', async () => {
@@ -262,14 +888,47 @@ describe('LedgerRead API', () => {
     for (let attempt = 0; attempt < 5; attempt += 1) {
       await agent
         .post('/auth/login')
+        .set('Origin', APP_ORIGIN)
         .send({ username: 'inventory.ivan', password: 'Wrong!Password1', workspace: 'admin' })
         .expect(401);
     }
 
     await agent
       .post('/auth/login')
+      .set('Origin', APP_ORIGIN)
       .send({ username: 'inventory.ivan', password: 'Inventory!2026', workspace: 'admin' })
       .expect(401);
+
+    const inventoryUserId = await findUserId('inventory.ivan');
+    await pool.query(
+      `
+      UPDATE users
+      SET failed_login_attempts = 5,
+          locked_until = NOW() - INTERVAL '1 minute'
+      WHERE id = $1
+      `,
+      [inventoryUserId],
+    );
+
+    await agent
+      .post('/auth/login')
+      .set('Origin', APP_ORIGIN)
+      .send({ username: 'inventory.ivan', password: 'Wrong!Password1', workspace: 'admin' })
+      .expect(401);
+
+    const postExpiryLockoutState = await pool.query<{
+      failed_login_attempts: number;
+      locked_until: string | null;
+    }>(
+      `
+      SELECT failed_login_attempts, locked_until
+      FROM users
+      WHERE id = $1
+      `,
+      [inventoryUserId],
+    );
+    expect(postExpiryLockoutState.rows[0]!.failed_login_attempts).toBe(1);
+    expect(postExpiryLockoutState.rows[0]!.locked_until).toBeNull();
 
     const finance = await login('finance.zoe', 'Finance!2026', 'finance');
     await pool.query(
@@ -283,7 +942,103 @@ describe('LedgerRead API', () => {
     );
 
     await finance.agent.get('/auth/session').expect(401);
-    await agent.get('/auth/session').set(authHeader('invalid-token')).expect(401);
+    await agent.get('/auth/session').expect(401);
+  });
+
+  it('counts parallel failed logins atomically and still locks accounts at the threshold', async () => {
+    const inventoryUserId = await findUserId('inventory.ivan');
+    await pool.query(
+      `
+      UPDATE users
+      SET failed_login_attempts = 0,
+          locked_until = NULL,
+          updated_at = NOW()
+      WHERE id = $1
+      `,
+      [inventoryUserId],
+    );
+
+    const attempts = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        agent
+          .post('/auth/login')
+          .set('Origin', APP_ORIGIN)
+          .send({ username: 'inventory.ivan', password: 'Wrong!Password1', workspace: 'admin' }),
+      ),
+    );
+    expect(attempts.every((response) => response.status === 401)).toBe(true);
+
+    const lockoutState = await pool.query<{
+      failed_login_attempts: number;
+      locked_until: string | null;
+    }>(
+      `
+      SELECT failed_login_attempts, locked_until
+      FROM users
+      WHERE id = $1
+      `,
+      [inventoryUserId],
+    );
+
+    expect(lockoutState.rows[0]!.failed_login_attempts).toBeGreaterThanOrEqual(5);
+    expect(lockoutState.rows[0]!.locked_until).not.toBeNull();
+    expect(new Date(lockoutState.rows[0]!.locked_until ?? 0).getTime()).toBeGreaterThan(Date.now());
+
+    await agent
+      .post('/auth/login')
+      .set('Origin', APP_ORIGIN)
+      .send({ username: 'inventory.ivan', password: 'Inventory!2026', workspace: 'admin' })
+      .expect(401);
+  });
+
+  it('counts mixed malformed and incorrect password attempts toward lockout consistently', async () => {
+    const inventoryUserId = await findUserId('inventory.ivan');
+    await pool.query(
+      `
+      UPDATE users
+      SET failed_login_attempts = 0,
+          locked_until = NULL,
+          updated_at = NOW()
+      WHERE id = $1
+      `,
+      [inventoryUserId],
+    );
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await agent
+        .post('/auth/login')
+        .set('Origin', APP_ORIGIN)
+        .send({ username: 'inventory.ivan', password: 'short', workspace: 'admin' })
+        .expect(401);
+    }
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await agent
+        .post('/auth/login')
+        .set('Origin', APP_ORIGIN)
+        .send({ username: 'inventory.ivan', password: 'Wrong!Password1', workspace: 'admin' })
+        .expect(401);
+    }
+
+    await agent
+      .post('/auth/login')
+      .set('Origin', APP_ORIGIN)
+      .send({ username: 'inventory.ivan', password: 'Inventory!2026', workspace: 'admin' })
+      .expect(401);
+
+    const lockoutState = await pool.query<{
+      failed_login_attempts: number;
+      locked_until: string | null;
+    }>(
+      `
+      SELECT failed_login_attempts, locked_until
+      FROM users
+      WHERE id = $1
+      `,
+      [inventoryUserId],
+    );
+    expect(lockoutState.rows[0]!.failed_login_attempts).toBeGreaterThanOrEqual(5);
+    expect(lockoutState.rows[0]!.locked_until).not.toBeNull();
   });
 
   it('allows finance read access while denying admin reconciliation mutations', async () => {
@@ -377,8 +1132,353 @@ describe('LedgerRead API', () => {
     await manager.agent.post('/auth/logout').expect(201);
   });
 
+  it('supports audited reconciliation status transitions with explicit role boundaries', async () => {
+    const suffix = Date.now();
+    const manager = await login('manager.li', 'Manager!2026', 'admin');
+    const importResponse = await manager.agent
+      .post('/admin/manifests/import')
+      .send({
+        supplierName: 'Workflow Test Press',
+        sourceFilename: `workflow-${suffix}.json`,
+        statementReference: `STMT-WORKFLOW-${suffix}`,
+        invoiceReference: `INV-WORKFLOW-${suffix}`,
+        freightCents: 100,
+        surchargeCents: 50,
+        paymentPlanStatus: 'DISPUTED',
+        items: [
+          {
+            sku: 'SKU-QH-PRINT',
+            statementQuantity: 12,
+            invoiceQuantity: 9,
+            statementExtendedAmountCents: 12000,
+            invoiceExtendedAmountCents: 10800,
+          },
+        ],
+      })
+      .expect(201);
+    expect(importResponse.body.discrepancyCount).toBe(1);
+
+    const paymentPlan = await pool.query<{ id: string }>(
+      `
+      SELECT id
+      FROM payment_plans
+      WHERE supplier_statement_id = $1
+      LIMIT 1
+      `,
+      [importResponse.body.statementId],
+    );
+    const discrepancy = await pool.query<{ id: string }>(
+      `
+      SELECT id
+      FROM reconciliation_discrepancies
+      WHERE supplier_statement_id = $1
+      LIMIT 1
+      `,
+      [importResponse.body.statementId],
+    );
+
+    const settlements = await manager.agent.get('/admin/settlements?status=DISPUTED').expect(200);
+    const importedPlan = settlements.body.paymentPlans.find((plan: { id: string }) => plan.id === paymentPlan.rows[0]!.id);
+    const importedDiscrepancy = settlements.body.discrepancies.find(
+      (item: { id: string }) => item.id === discrepancy.rows[0]!.id,
+    );
+    expect(importedPlan.allowedTransitions).toEqual(expect.arrayContaining(['MATCHED', 'PARTIAL', 'PENDING']));
+    expect(importedDiscrepancy.allowedTransitions).toEqual(
+      expect.arrayContaining(['UNDER_REVIEW', 'RESOLVED', 'WAIVED']),
+    );
+    await manager.agent.post('/auth/logout').expect(201);
+
+    const inventory = await login('inventory.ivan', 'Inventory!2026', 'admin');
+    await inventory.agent
+      .patch(`/admin/payment-plans/${paymentPlan.rows[0]!.id}/status`)
+      .send({ status: 'MATCHED' })
+      .expect(403);
+
+    await inventory.agent
+      .patch(`/admin/discrepancies/${discrepancy.rows[0]!.id}/status`)
+      .send({ status: 'UNDER_REVIEW' })
+      .expect(200);
+    await inventory.agent.post('/auth/logout').expect(201);
+
+    const finance = await login('finance.zoe', 'Finance!2026', 'finance');
+    await finance.agent
+      .patch(`/admin/discrepancies/${discrepancy.rows[0]!.id}/status`)
+      .send({ status: 'RESOLVED' })
+      .expect(403);
+
+    await finance.agent
+      .patch(`/admin/payment-plans/${paymentPlan.rows[0]!.id}/status`)
+      .send({ status: 'MATCHED' })
+      .expect(200);
+
+    await finance.agent
+      .patch(`/admin/payment-plans/${paymentPlan.rows[0]!.id}/status`)
+      .send({ status: 'PENDING' })
+      .expect(409)
+      .expect(({ body }) => {
+        expect(body.message).toBe('Payment plan status cannot transition from MATCHED to PENDING.');
+      });
+    await finance.agent.post('/auth/logout').expect(201);
+
+    const updatedPlan = await pool.query<{ status: string }>(
+      'SELECT status FROM payment_plans WHERE id = $1',
+      [paymentPlan.rows[0]!.id],
+    );
+    const updatedDiscrepancy = await pool.query<{ status: string }>(
+      'SELECT status FROM reconciliation_discrepancies WHERE id = $1',
+      [discrepancy.rows[0]!.id],
+    );
+    expect(updatedPlan.rows[0]!.status).toBe('MATCHED');
+    expect(updatedDiscrepancy.rows[0]!.status).toBe('UNDER_REVIEW');
+
+    const auditActions = await pool.query<{ action: string }>(
+      `
+      SELECT action
+      FROM audit_logs
+      WHERE entity_id IN ($1, $2)
+        AND action IN ('PAYMENT_PLAN_STATUS_UPDATED', 'RECONCILIATION_DISCREPANCY_STATUS_UPDATED')
+      ORDER BY created_at ASC
+      `,
+      [paymentPlan.rows[0]!.id, discrepancy.rows[0]!.id],
+    );
+    expect(auditActions.rows.map((row) => row.action)).toEqual([
+      'RECONCILIATION_DISCREPANCY_STATUS_UPDATED',
+      'PAYMENT_PLAN_STATUS_UPDATED',
+    ]);
+  });
+
+  it('rejects malformed privileged admin params and invalid audit-log limits at the controller boundary', async () => {
+    const manager = await login('manager.li', 'Manager!2026', 'admin');
+
+    await manager.agent
+      .patch('/admin/payment-plans/not-a-uuid/status')
+      .send({ status: 'MATCHED' })
+      .expect(400)
+      .expect(({ body }) => {
+        expect(String(body.message)).toContain('uuid');
+      });
+
+    await manager.agent
+      .patch('/admin/discrepancies/not-a-uuid/status')
+      .send({ status: 'UNDER_REVIEW' })
+      .expect(400)
+      .expect(({ body }) => {
+        expect(String(body.message)).toContain('uuid');
+      });
+
+    await manager.agent
+      .get('/admin/audit-logs?limit=abc')
+      .expect(400)
+      .expect(({ body }) => {
+        expect(body.message).toEqual(expect.arrayContaining(['limit must be an integer number']));
+      });
+
+    await manager.agent
+      .get('/admin/audit-logs?limit=-1')
+      .expect(400)
+      .expect(({ body }) => {
+        expect(body.message).toEqual(expect.arrayContaining(['limit must not be less than 1']));
+      });
+
+    await manager.agent
+      .get('/admin/audit-logs?limit=0')
+      .expect(400)
+      .expect(({ body }) => {
+        expect(body.message).toEqual(expect.arrayContaining(['limit must not be less than 1']));
+      });
+
+    await manager.agent
+      .get(`/admin/audit-logs?limit=${MAX_AUDIT_LOG_LIMIT + 1}`)
+      .expect(400)
+      .expect(({ body }) => {
+        expect(body.message).toEqual(
+          expect.arrayContaining([`limit must not be greater than ${MAX_AUDIT_LOG_LIMIT}`]),
+        );
+      });
+
+    await manager.agent
+      .patch('/admin/payment-plans/00000000-0000-4000-8000-000000000901/status')
+      .send({ status: 'MATCHED' })
+      .expect(404)
+      .expect(({ body }) => {
+        expect(body.message).toBe('Payment plan not found.');
+      });
+
+    await manager.agent
+      .patch('/admin/discrepancies/00000000-0000-4000-8000-000000000902/status')
+      .send({ status: 'UNDER_REVIEW' })
+      .expect(404)
+      .expect(({ body }) => {
+        expect(body.message).toBe('Reconciliation discrepancy not found.');
+      });
+
+    await manager.agent
+      .get('/admin/audit-logs?limit=1')
+      .expect(200);
+
+    await manager.agent.post('/auth/logout').expect(201);
+  });
+
+  it('enforces server-side audit-log minimization with role-aware payload projection', async () => {
+    const manager = await login('manager.li', 'Manager!2026', 'admin');
+    const finance = await login('finance.zoe', 'Finance!2026', 'finance');
+    const action = `AUDIT_VISIBILITY_TEST_${Date.now()}`;
+    const latestAudit = await pool.query<{ current_hash: string }>(
+      'SELECT current_hash FROM audit_logs ORDER BY created_at DESC, id DESC LIMIT 1',
+    );
+    const createdAt = new Date().toISOString();
+    const auditPayload = {
+      commentType: 'QUESTION',
+      status: 'UNDER_REVIEW',
+      total: 1200,
+      body: 'should-not-leak',
+      hashProbe: 'should-not-leak',
+    };
+    const chainPayload = {
+      traceId: `trace-${action}`,
+      actorUserId: manager.user.id,
+      action,
+      entityType: 'audit_visibility',
+      entityId: `audit-row-${Date.now()}`,
+      payload: auditPayload,
+      createdAt,
+    };
+    const currentHash = chainHash(chainPayload, latestAudit.rows[0]?.current_hash ?? null);
+    const signature = chainSignature(
+      'audit',
+      chainPayload,
+      latestAudit.rows[0]?.current_hash ?? null,
+      currentHash,
+    );
+
+    await pool.query(
+      `
+      INSERT INTO audit_logs (
+        trace_id,
+        actor_user_id,
+        action,
+        entity_type,
+        entity_id,
+        payload,
+        previous_hash,
+        current_hash,
+        chain_signature,
+        created_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10)
+      `,
+      [
+        chainPayload.traceId,
+        chainPayload.actorUserId,
+        chainPayload.action,
+        chainPayload.entityType,
+        chainPayload.entityId,
+        JSON.stringify(chainPayload.payload),
+        latestAudit.rows[0]?.current_hash ?? null,
+        currentHash,
+        signature,
+        createdAt,
+      ],
+    );
+
+    const managerAudit = await manager.agent
+      .get(`/admin/audit-logs?limit=1&action=${encodeURIComponent(action)}`)
+      .expect(200);
+    const managerRow = managerAudit.body[0] as Record<string, unknown>;
+    expect(managerRow.previous_hash).toBeUndefined();
+    expect(managerRow.current_hash).toBeUndefined();
+    expect((managerRow.payload as Record<string, unknown>).commentType).toBe('QUESTION');
+    expect((managerRow.payload as Record<string, unknown>).total).toBe(1200);
+    expect((managerRow.payload as Record<string, unknown>).body).toBeUndefined();
+    expect(Number(managerRow.redacted_fields)).toBeGreaterThanOrEqual(1);
+
+    const financeAudit = await finance.agent
+      .get(`/admin/audit-logs?limit=1&action=${encodeURIComponent(action)}`)
+      .expect(200);
+    const financeRow = financeAudit.body[0] as Record<string, unknown>;
+    expect(financeRow.previous_hash).toBeUndefined();
+    expect(financeRow.current_hash).toBeUndefined();
+    expect((financeRow.payload as Record<string, unknown>).total).toBe(1200);
+    expect((financeRow.payload as Record<string, unknown>).commentType).toBeUndefined();
+    expect((financeRow.payload as Record<string, unknown>).body).toBeUndefined();
+    expect(Number(financeRow.redacted_fields)).toBeGreaterThanOrEqual(1);
+
+    await manager.agent.post('/auth/logout').expect(201);
+    await finance.agent.post('/auth/logout').expect(201);
+  });
+
+  it('rejects malformed GraphQL customer UUID args at the resolver boundary', async () => {
+    const customer = await login('reader.ada', 'Reader!2026', 'app');
+
+    const malformedTitle = await graphqlResponse(
+      customer.agent,
+      'query ($id: String!) { title(id: $id) { id name } }',
+      { id: 'not-a-uuid' },
+    );
+    expect(malformedTitle.body.data).toBeNull();
+    expect(malformedTitle.body.errors?.[0]?.message).toContain('uuid');
+    expect(malformedTitle.body.errors?.[0]?.extensions?.originalError?.statusCode).toBe(400);
+
+    const malformedThread = await graphqlResponse(
+      customer.agent,
+      `
+        query ($titleId: String!) {
+          communityThread(titleId: $titleId) {
+            titleId
+            comments {
+              id
+            }
+          }
+        }
+      `,
+      { titleId: 'not-a-uuid' },
+    );
+    expect(malformedThread.body.data).toBeNull();
+    expect(malformedThread.body.errors?.[0]?.message).toContain('uuid');
+    expect(malformedThread.body.errors?.[0]?.extensions?.originalError?.statusCode).toBe(400);
+
+    const malformedRecommendations = await graphqlResponse(
+      customer.agent,
+      'query ($titleId: String!) { recommendations(titleId: $titleId) { titleId reason recommendedTitleIds traceId } }',
+      { titleId: 'not-a-uuid' },
+    );
+    expect(malformedRecommendations.body.data).toBeNull();
+    expect(malformedRecommendations.body.errors?.[0]?.message).toContain('uuid');
+    expect(malformedRecommendations.body.errors?.[0]?.extensions?.originalError?.statusCode).toBe(400);
+
+    const missingTitle = await graphqlResponse(
+      customer.agent,
+      'query ($id: String!) { title(id: $id) { id name } }',
+      { id: '00000000-0000-4000-8000-000000000777' },
+    );
+    expect(missingTitle.body.data).toBeNull();
+    expect(missingTitle.body.errors?.[0]?.message).toBe('Title not found.');
+    expect(missingTitle.body.errors?.[0]?.extensions?.originalError?.statusCode).toBe(404);
+
+    const missingThread = await graphqlResponse(
+      customer.agent,
+      `
+        query ($titleId: String!) {
+          communityThread(titleId: $titleId) {
+            titleId
+            comments {
+              id
+            }
+          }
+        }
+      `,
+      { titleId: '00000000-0000-4000-8000-000000000778' },
+    );
+    expect(missingThread.body.data).toBeNull();
+    expect(missingThread.body.errors?.[0]?.message).toBe('Title not found.');
+    expect(missingThread.body.errors?.[0]?.extensions?.originalError?.statusCode).toBe(404);
+
+    await customer.agent.post('/auth/logout').expect(201);
+  });
+
   it('rejects malformed identifiers and invalid admin intake payloads with 400 responses', async () => {
     const customer = await login('reader.ada', 'Reader!2026', 'app');
+    const customerProfile = await customer.agent.get('/profiles/me').expect(200);
 
     await customer.agent
       .post('/community/comments')
@@ -386,6 +1486,15 @@ describe('LedgerRead API', () => {
         titleId: 'not-a-uuid',
         commentType: 'COMMENT',
         body: 'Validation should reject malformed title IDs before Postgres sees them.',
+      })
+      .expect(400);
+
+    await customer.agent
+      .post('/community/comments')
+      .send({
+        titleId: '00000000-0000-4000-8000-000000000555',
+        commentType: 'COMMENT',
+        body: '   ',
       })
       .expect(400);
 
@@ -422,6 +1531,17 @@ describe('LedgerRead API', () => {
       })
       .expect(400);
 
+    await customer.agent
+      .put('/profiles/me')
+      .send({
+        deviceLabel: '   ',
+        preferences: {
+          ...customerProfile.body.preferences,
+          updatedAt: new Date().toISOString(),
+        },
+      })
+      .expect(400);
+
     await customer.agent.post('/auth/logout').expect(201);
 
     const moderator = await login('mod.noah', 'Moderator!2026', 'mod');
@@ -431,6 +1551,13 @@ describe('LedgerRead API', () => {
         reportId: 'not-a-uuid',
         action: 'hide',
         notes: 'Malformed moderation target should fail validation.',
+      })
+      .expect(400);
+    await moderator.agent
+      .post('/moderation/actions')
+      .send({
+        action: 'hide',
+        notes: '   ',
       })
       .expect(400);
     await moderator.agent.post('/auth/logout').expect(201);
@@ -477,7 +1604,199 @@ describe('LedgerRead API', () => {
         ],
       })
       .expect(400);
+    await manager.agent
+      .post('/admin/manifests/import')
+      .send({
+        supplierName: '   ',
+        sourceFilename: 'invalid-manifest.json',
+        statementReference: 'STMT-BLANK-1',
+        invoiceReference: 'INV-BLANK-1',
+        freightCents: 0,
+        surchargeCents: 0,
+        paymentPlanStatus: 'PENDING',
+        items: [
+          {
+            sku: 'SKU-BKMK-01',
+            statementQuantity: 1,
+            invoiceQuantity: 1,
+            statementExtendedAmountCents: 300,
+            invoiceExtendedAmountCents: 300,
+          },
+        ],
+      })
+      .expect(400);
+    await manager.agent
+      .post('/admin/manifests/import')
+      .send({
+        supplierName: 'Validation Press',
+        sourceFilename: '   ',
+        statementReference: 'STMT-BLANK-2',
+        invoiceReference: 'INV-BLANK-2',
+        freightCents: 0,
+        surchargeCents: 0,
+        paymentPlanStatus: 'PENDING',
+        items: [
+          {
+            sku: 'SKU-BKMK-01',
+            statementQuantity: 1,
+            invoiceQuantity: 1,
+            statementExtendedAmountCents: 300,
+            invoiceExtendedAmountCents: 300,
+          },
+        ],
+      })
+      .expect(400);
+    await manager.agent
+      .post('/admin/manifests/import')
+      .send({
+        supplierName: 'Validation Press',
+        sourceFilename: 'invalid-manifest.json',
+        statementReference: '   ',
+        invoiceReference: 'INV-BLANK-3',
+        freightCents: 0,
+        surchargeCents: 0,
+        paymentPlanStatus: 'PENDING',
+        items: [
+          {
+            sku: 'SKU-BKMK-01',
+            statementQuantity: 1,
+            invoiceQuantity: 1,
+            statementExtendedAmountCents: 300,
+            invoiceExtendedAmountCents: 300,
+          },
+        ],
+      })
+      .expect(400);
+    await manager.agent
+      .post('/admin/manifests/import')
+      .send({
+        supplierName: 'Validation Press',
+        sourceFilename: 'invalid-manifest.json',
+        statementReference: 'STMT-BLANK-4',
+        invoiceReference: '   ',
+        freightCents: 0,
+        surchargeCents: 0,
+        paymentPlanStatus: 'PENDING',
+        items: [
+          {
+            sku: 'SKU-BKMK-01',
+            statementQuantity: 1,
+            invoiceQuantity: 1,
+            statementExtendedAmountCents: 300,
+            invoiceExtendedAmountCents: 300,
+          },
+        ],
+      })
+      .expect(400);
+    await manager.agent
+      .post('/admin/manifests/import')
+      .send({
+        supplierName: 'Validation Press',
+        sourceFilename: 'invalid-manifest.json',
+        statementReference: 'STMT-BLANK-5',
+        invoiceReference: 'INV-BLANK-5',
+        freightCents: 0,
+        surchargeCents: 0,
+        paymentPlanStatus: 'PENDING',
+        items: [
+          {
+            sku: '   ',
+            statementQuantity: 1,
+            invoiceQuantity: 1,
+            statementExtendedAmountCents: 300,
+            invoiceExtendedAmountCents: 300,
+          },
+        ],
+      })
+      .expect(400);
     await manager.agent.post('/auth/logout').expect(201);
+  });
+
+  it('enforces core role/workspace/status domains with DB-level constraints', async () => {
+    const readerId = await findUserId('reader.ada');
+    const moderatorId = await findUserId('mod.noah');
+    const clerkId = await findUserId('clerk.emma');
+    const title = await pool.query<{ id: string }>(
+      "SELECT id FROM titles WHERE slug = 'quiet-harbor-digital'",
+    );
+    const comment = await pool.query<{ id: string }>(
+      'SELECT id FROM comments WHERE title_id = $1 ORDER BY created_at ASC, id ASC LIMIT 1',
+      [title.rows[0]!.id],
+    );
+
+    await expect(
+      pool.query("UPDATE users SET role = 'ROOT' WHERE id = $1", [readerId]),
+    ).rejects.toThrow(/users_role_check|check constraint/i);
+
+    const sessionToken = await issueSessionToken({
+      userId: readerId,
+      workspace: 'app',
+      token: `domain-check-${Date.now()}`,
+    });
+    const sessionHash = createHash('sha256').update(sessionToken).digest('hex');
+    await expect(
+      pool.query("UPDATE sessions SET workspace = 'root' WHERE token_hash = $1", [sessionHash]),
+    ).rejects.toThrow(/sessions_workspace_check|check constraint/i);
+    await pool.query('DELETE FROM sessions WHERE token_hash = $1', [sessionHash]);
+
+    await expect(
+      pool.query("UPDATE titles SET format = 'AUDIO' WHERE id = $1", [title.rows[0]!.id]),
+    ).rejects.toThrow(/titles_format_check|check constraint/i);
+
+    await expect(
+      pool.query("UPDATE comments SET comment_type = 'THREAD' WHERE id = $1", [comment.rows[0]!.id]),
+    ).rejects.toThrow(/comments_comment_type_check|check constraint/i);
+
+    const report = await pool.query<{ id: string }>(
+      `
+      INSERT INTO reports (comment_id, reporter_user_id, category, notes)
+      VALUES ($1, $2, 'ABUSE', 'Constraint coverage note.')
+      RETURNING id
+      `,
+      [comment.rows[0]!.id, readerId],
+    );
+    await expect(
+      pool.query("UPDATE reports SET status = 'DISMISSED' WHERE id = $1", [report.rows[0]!.id]),
+    ).rejects.toThrow(/reports_status_check|check constraint/i);
+
+    const moderationAction = await pool.query<{ id: string }>(
+      `
+      INSERT INTO moderation_actions (moderator_user_id, report_id, target_user_id, target_comment_id, action, notes)
+      VALUES ($1, $2, $3, $4, 'hide', 'Constraint coverage action.')
+      RETURNING id
+      `,
+      [moderatorId, report.rows[0]!.id, readerId, comment.rows[0]!.id],
+    );
+    await expect(
+      pool.query("UPDATE moderation_actions SET action = 'banish' WHERE id = $1", [
+        moderationAction.rows[0]!.id,
+      ]),
+    ).rejects.toThrow(/moderation_actions_action_check|check constraint/i);
+
+    const cart = await pool.query<{ id: string }>(
+      'INSERT INTO carts (clerk_user_id) VALUES ($1) RETURNING id',
+      [clerkId],
+    );
+    await expect(
+      pool.query("UPDATE carts SET status = 'ABANDONED' WHERE id = $1", [cart.rows[0]!.id]),
+    ).rejects.toThrow(/carts_status_check|check constraint/i);
+
+    const order = await pool.query<{ id: string }>(
+      `
+      INSERT INTO orders (cart_id, clerk_user_id, payment_method, payment_note_cipher, subtotal_cents, discount_cents, fee_cents, total_cents)
+      VALUES ($1, $2, 'CASH', $3, 100, 0, 0, 100)
+      RETURNING id
+      `,
+      [cart.rows[0]!.id, clerkId, encryptAtRestValue(encryptionKey(), 'Constraint coverage note')],
+    );
+    await expect(
+      pool.query("UPDATE orders SET payment_method = 'WIRE_TRANSFER' WHERE id = $1", [order.rows[0]!.id]),
+    ).rejects.toThrow(/orders_payment_method_check|check constraint/i);
+
+    await pool.query('DELETE FROM orders WHERE id = $1', [order.rows[0]!.id]);
+    await pool.query('DELETE FROM carts WHERE id = $1', [cart.rows[0]!.id]);
+    await pool.query('DELETE FROM moderation_actions WHERE id = $1', [moderationAction.rows[0]!.id]);
+    await pool.query('DELETE FROM reports WHERE id = $1', [report.rows[0]!.id]);
   });
 
   it('enforces attendance authorization and records successful clerk attendance writes', async () => {
@@ -512,1031 +1831,15 @@ describe('LedgerRead API', () => {
       SELECT event_type
       FROM attendance_records
       WHERE user_id = $1
-      ORDER BY created_at DESC
+      ORDER BY created_at DESC, id DESC
       LIMIT 2
       `,
       [clerk.user.id],
     );
     expect(clerkAttendance.rows.map((row) => row.event_type)).toEqual(['CLOCK_OUT', 'CLOCK_IN']);
 
-    await pool.query(
-      `
-      DELETE FROM risk_alerts
-      WHERE attendance_record_id IN (
-        SELECT id
-        FROM attendance_records
-        WHERE user_id = $1
-      )
-      `,
-      [clerk.user.id],
-    );
-    await pool.query('DELETE FROM attendance_records WHERE user_id = $1', [clerk.user.id]);
+    await pool.query('TRUNCATE TABLE risk_alerts, attendance_records RESTART IDENTITY CASCADE');
 
     await clerk.agent.post('/auth/logout').expect(201);
-  });
-
-  it('runs the customer flow with profile isolation, masking, sync conflicts, and trace logging', async () => {
-    const customer = await login('reader.ada', 'Reader!2026', 'app');
-    const otherCustomerId = await findUserId('reader.mei');
-    const title = await pool.query<{ id: string; author_id: string; series_id: string | null }>(
-      "SELECT id, author_id, series_id FROM titles WHERE slug = 'quiet-harbor-digital'",
-    );
-
-    await customer.agent.get('/auth/session').expect(200);
-
-    const myProfile = await customer.agent.get('/profiles/me').expect(200);
-    expect(myProfile.body.username).toBe('reader.ada');
-    const storedUser = await pool.query<{
-      username: string | null;
-      username_cipher: string | null;
-      username_lookup_hash: string | null;
-    }>(
-      `
-      SELECT username, username_cipher, username_lookup_hash
-      FROM users
-      WHERE id = $1
-      `,
-      [customer.user.id],
-    );
-    expect(storedUser.rows[0]!.username).toBeNull();
-    expect(storedUser.rows[0]!.username_cipher).toBeTruthy();
-    expect(storedUser.rows[0]!.username_lookup_hash).toBe(usernameHash('reader.ada'));
-
-    const updatedProfile = await customer.agent
-      .put('/profiles/me')
-      .send({
-        deviceLabel: 'Reviewer Tablet',
-        preferences: {
-          ...myProfile.body.preferences,
-          fontSize: 20,
-          updatedAt: new Date().toISOString(),
-        },
-      })
-      .expect(200);
-
-    await customer.agent
-      .put('/profiles/me')
-      .send({
-        deviceLabel: 'Imported Tablet',
-        preferences: {
-          ...myProfile.body.preferences,
-          fontSize: 18,
-          updatedAt: '2026-03-01T00:00:00.000Z',
-        },
-      })
-      .expect(409);
-
-    await customer.agent
-      .get(`/profiles/${otherCustomerId}`)
-      .expect(404);
-
-    await customer.agent
-      .post('/profiles/me/sync')
-      .send({
-        deviceLabel: 'Old Device',
-        strict: true,
-        preferences: {
-          ...myProfile.body.preferences,
-          updatedAt: '2025-01-01T00:00:00.000Z',
-        },
-      })
-      .expect(409);
-
-    const serverWonSync = await customer.agent
-      .post('/profiles/me/sync')
-      .send({
-        deviceLabel: 'Imported Kiosk',
-        strict: false,
-        preferences: {
-          ...myProfile.body.preferences,
-          fontSize: 16,
-          updatedAt: '2025-01-02T00:00:00.000Z',
-        },
-      })
-      .expect(201);
-    expect(serverWonSync.body.resolution).toBe('SERVER_WON');
-    expect(serverWonSync.body.profile.updatedAt).toBe(updatedProfile.body.updatedAt);
-    expect(serverWonSync.body.profile.deviceLabel).toBe(updatedProfile.body.deviceLabel);
-
-    const catalog = await graphql<{
-      catalog: { featured: Array<{ id: string; name: string }>; bestSellers: Array<{ id: string; name: string }> };
-    }>(customer.agent, 'query { catalog { featured { id name } bestSellers { id name } } }');
-    expect(catalog.catalog.featured.length).toBeGreaterThan(0);
-
-    const titleResponse = await graphql<{
-      title: { id: string; name: string; chapters: Array<{ id: string; name: string; body: string }> };
-    }>(
-      customer.agent,
-      'query ($id: String!) { title(id: $id) { id name chapters { id name body } } }',
-      { id: title.rows[0]!.id },
-    );
-    expect(titleResponse.title.chapters.length).toBeGreaterThan(0);
-
-    const tracesBefore = await pool.query<{ count: string }>(
-      'SELECT COUNT(*)::text AS count FROM recommendation_traces WHERE title_id = $1',
-      [title.rows[0]!.id],
-    );
-    const recommendationsFirst = await graphql<{
-      recommendations: { titleId: string; reason: string; recommendedTitleIds: string[]; traceId: string };
-    }>(
-      customer.agent,
-      'query ($titleId: String!) { recommendations(titleId: $titleId) { titleId reason recommendedTitleIds traceId } }',
-      { titleId: title.rows[0]!.id },
-    );
-    const recommendationsSecond = await graphql<{
-      recommendations: { titleId: string; reason: string; recommendedTitleIds: string[]; traceId: string };
-    }>(
-      customer.agent,
-      'query ($titleId: String!) { recommendations(titleId: $titleId) { titleId reason recommendedTitleIds traceId } }',
-      { titleId: title.rows[0]!.id },
-    );
-    expect(recommendationsFirst.recommendations.recommendedTitleIds.length).toBeGreaterThan(0);
-    expect(recommendationsSecond.recommendations.recommendedTitleIds.length).toBeGreaterThan(0);
-
-    const tracesAfter = await pool.query<{ count: string }>(
-      'SELECT COUNT(*)::text AS count FROM recommendation_traces WHERE title_id = $1',
-      [title.rows[0]!.id],
-    );
-    expect(Number(tracesAfter.rows[0]!.count) - Number(tracesBefore.rows[0]!.count)).toBe(2);
-
-    const recentStrategies = await pool.query<{ strategy: string }>(
-      `
-      SELECT strategy
-      FROM recommendation_traces
-      WHERE title_id = $1
-      ORDER BY created_at DESC
-      LIMIT 2
-      `,
-      [title.rows[0]!.id],
-    );
-    expect(recentStrategies.rows.map((row) => row.strategy)).toEqual(
-      expect.arrayContaining(['CACHE_HIT']),
-    );
-
-    const threadBeforeMask = await graphql<{
-      communityThread: {
-        titleId: string;
-        comments: Array<{
-          id: string;
-          authorId: string;
-          commentType: string;
-          createdAt: string;
-          visibleBody: string;
-          replies: Array<{ id: string; authorId: string; visibleBody: string }>;
-        }>;
-      };
-    }>(
-      customer.agent,
-      `
-        query ($titleId: String!) {
-          communityThread(titleId: $titleId) {
-            titleId
-            comments {
-              id
-              authorId
-              commentType
-              createdAt
-              visibleBody
-              replies {
-                id
-                authorId
-                visibleBody
-              }
-            }
-          }
-        }
-      `,
-      { titleId: title.rows[0]!.id },
-    );
-    expect(threadBeforeMask.communityThread.comments.length).toBeGreaterThan(0);
-    expect(Number.isNaN(Date.parse(threadBeforeMask.communityThread.comments[0]!.createdAt))).toBe(false);
-    const meiRootComment = threadBeforeMask.communityThread.comments.find(
-      (comment) => comment.authorId === otherCustomerId,
-    );
-    expect(meiRootComment?.visibleBody).toContain('late-night reading');
-
-    const newCommentBody = `Local review note ${Date.now()}`;
-    await customer.agent
-      .post('/community/comments')
-      .send({
-        titleId: title.rows[0]!.id,
-        commentType: 'COMMENT',
-        body: newCommentBody,
-      })
-      .expect(201);
-
-    await customer.agent
-      .post('/community/comments')
-      .send({
-        titleId: title.rows[0]!.id,
-        commentType: 'COMMENT',
-        body: newCommentBody,
-      })
-      .expect(409);
-
-    await customer.agent
-      .post('/community/ratings')
-      .send({
-        titleId: title.rows[0]!.id,
-        rating: 5,
-      })
-      .expect(201);
-
-    await customer.agent
-      .post('/community/favorites')
-      .send({
-        titleId: title.rows[0]!.id,
-        active: true,
-      })
-      .expect(201);
-
-    await customer.agent
-      .post('/community/subscriptions/authors')
-      .send({
-        targetId: title.rows[0]!.author_id,
-        active: true,
-      })
-      .expect(201);
-
-    await customer.agent
-      .post('/community/subscriptions/series')
-      .send({
-        targetId: title.rows[0]!.series_id,
-        active: true,
-      })
-      .expect(201);
-
-    await customer.agent
-      .post('/community/relationships/mute')
-      .send({
-        targetUserId: otherCustomerId,
-        active: true,
-      })
-      .expect(201);
-
-    await customer.agent
-      .post('/community/relationships/block')
-      .send({
-        targetUserId: otherCustomerId,
-        active: true,
-      })
-      .expect(201);
-
-    const threadAfterMask = await graphql<{
-      communityThread: {
-        comments: Array<{ id: string; authorId: string; visibleBody: string }>;
-      };
-    }>(
-      customer.agent,
-      `
-        query ($titleId: String!) {
-          communityThread(titleId: $titleId) {
-            comments {
-              id
-              authorId
-              visibleBody
-            }
-          }
-        }
-      `,
-      { titleId: title.rows[0]!.id },
-    );
-    expect(
-      threadAfterMask.communityThread.comments.find(
-        (comment) => comment.authorId === otherCustomerId,
-      )?.visibleBody,
-    ).toBe('[masked for viewer policy]');
-
-    await customer.agent
-      .post('/community/reports')
-      .send({
-        commentId: meiRootComment!.id,
-        category: 'ABUSE',
-        notes: 'Testing the moderation pipeline from the reader workspace.',
-      })
-      .expect(201);
-
-    await customer.agent.get('/moderation/queue').expect(403);
-    await customer.agent.post('/pos/carts').send({}).expect(403);
-    await customer.agent.post('/auth/logout').expect(201);
-  });
-
-  it('rejects sensitive words and per-minute community spam bursts', async () => {
-    const customer = await login('reader.mei', 'Reader!2026', 'app');
-    const title = await pool.query<{ id: string }>(
-      "SELECT id FROM titles WHERE slug = 'quiet-harbor-digital'",
-    );
-
-    await pool.query(
-      `
-      UPDATE comments
-      SET created_at = NOW() - INTERVAL '2 minutes'
-      WHERE user_id = $1
-      `,
-      [customer.user.id],
-    );
-
-    await customer.agent
-      .post('/community/comments')
-      .send({
-        titleId: title.rows[0]!.id,
-        commentType: 'COMMENT',
-        body: 'This spoiler should be rejected locally.',
-      })
-      .expect(409);
-
-    for (let index = 0; index < 10; index += 1) {
-      await customer.agent
-        .post('/community/comments')
-        .send({
-          titleId: title.rows[0]!.id,
-          commentType: 'COMMENT',
-          body: `rate-limit-${Date.now()}-${index}`,
-        })
-        .expect(201);
-    }
-
-    await customer.agent
-      .post('/community/comments')
-      .send({
-        titleId: title.rows[0]!.id,
-        commentType: 'COMMENT',
-        body: `rate-limit-overflow-${Date.now()}`,
-      })
-      .expect(409);
-
-    await customer.agent.post('/auth/logout').expect(201);
-  });
-
-  it('enforces same-title reply integrity and rejects blank report metadata', async () => {
-    const customer = await login('reader.ada', 'Reader!2026', 'app');
-    const quietHarbor = await pool.query<{ id: string }>(
-      "SELECT id FROM titles WHERE slug = 'quiet-harbor-digital'",
-    );
-    const alternateTitle = await pool.query<{ id: string }>(
-      `
-      SELECT id
-      FROM titles
-      WHERE id <> $1
-      ORDER BY created_at ASC
-      LIMIT 1
-      `,
-      [quietHarbor.rows[0]!.id],
-    );
-    const quietHarborParent = await pool.query<{ id: string }>(
-      `
-      SELECT id
-      FROM comments
-      WHERE title_id = $1
-      ORDER BY created_at ASC
-      LIMIT 1
-      `,
-      [quietHarbor.rows[0]!.id],
-    );
-
-    const sameTitleReply = await customer.agent
-      .post('/community/comments')
-      .send({
-        titleId: quietHarbor.rows[0]!.id,
-        parentCommentId: quietHarborParent.rows[0]!.id,
-        commentType: 'QUESTION',
-        body: `reply-integrity-${Date.now()}`,
-      })
-      .expect(201);
-    expect(sameTitleReply.body.id).toBeTruthy();
-
-    const otherTitleParent = await customer.agent
-      .post('/community/comments')
-      .send({
-        titleId: alternateTitle.rows[0]!.id,
-        commentType: 'COMMENT',
-        body: `cross-title-parent-${Date.now()}`,
-      })
-      .expect(201);
-
-    await customer.agent
-      .post('/community/comments')
-      .send({
-        titleId: quietHarbor.rows[0]!.id,
-        parentCommentId: otherTitleParent.body.id,
-        commentType: 'QUESTION',
-        body: `cross-title-reply-${Date.now()}`,
-      })
-      .expect(400);
-
-    await customer.agent
-      .post('/community/reports')
-      .send({
-        commentId: '   ',
-        category: 'ABUSE',
-        notes: 'Valid notes',
-      })
-      .expect(400);
-
-    await customer.agent
-      .post('/community/reports')
-      .send({
-        commentId: quietHarborParent.rows[0]!.id,
-        category: '   ',
-        notes: 'Valid notes',
-      })
-      .expect(400);
-
-    await customer.agent
-      .post('/community/reports')
-      .send({
-        commentId: quietHarborParent.rows[0]!.id,
-        category: 'ABUSE',
-        notes: '   ',
-      })
-      .expect(400);
-
-    await customer.agent
-      .post('/community/reports')
-      .send({
-        commentId: quietHarborParent.rows[0]!.id,
-        category: 'ABUSE',
-        notes: 'Valid governance report metadata.',
-      })
-      .expect(201);
-
-    await customer.agent
-      .post('/community/relationships/mute')
-      .send({
-        targetUserId: '   ',
-        active: true,
-      })
-      .expect(400);
-
-    await customer.agent
-      .post('/community/relationships/block')
-      .send({
-        targetUserId: '',
-        active: true,
-      })
-      .expect(400);
-
-    await customer.agent.post('/auth/logout').expect(201);
-  });
-
-  it('enforces review-before-checkout and validates evidence upload boundaries', async () => {
-    const clerk = await login('clerk.emma', 'Clerk!2026', 'pos');
-    const search = await clerk.agent.get('/pos/search?q=qui').expect(200);
-    expect(search.body.some((item: { sku: string }) => item.sku === 'SKU-QH-PRINT')).toBe(true);
-
-    const cartWithoutReview = await clerk.agent.post('/pos/carts').send({}).expect(201);
-    const adjustableLine = await clerk.agent
-      .post(`/pos/carts/${cartWithoutReview.body.cartId}/items`)
-      .send({ sku: 'SKU-BKMK-01', quantity: 2 })
-      .expect(201);
-    expect(adjustableLine.body.items[0].quantity).toBe(2);
-
-    await clerk.agent
-      .post(`/pos/carts/${cartWithoutReview.body.cartId}/checkout`)
-      .send({ paymentMethod: 'CASH', paymentNote: 'Skip review attempt' })
-      .expect(409);
-
-    const adjustedLine = await clerk.agent
-      .patch(
-        `/pos/carts/${cartWithoutReview.body.cartId}/items/${adjustableLine.body.items[0].cartItemId}`,
-      )
-      .send({ quantity: 1 })
-      .expect(200);
-    expect(adjustedLine.body.items[0].quantity).toBe(1);
-    expect(adjustedLine.body.reviewReady).toBe(false);
-
-    await clerk.agent
-      .post(`/pos/carts/${cartWithoutReview.body.cartId}/checkout`)
-      .send({ paymentMethod: 'CASH', paymentNote: 'Adjusted cart without re-review' })
-      .expect(409);
-
-    const removedLine = await clerk.agent
-      .delete(
-        `/pos/carts/${cartWithoutReview.body.cartId}/items/${adjustedLine.body.items[0].cartItemId}`,
-      )
-      .expect(200);
-    expect(removedLine.body.items).toHaveLength(0);
-    expect(removedLine.body.reviewReady).toBe(false);
-
-    const cart = await clerk.agent.post('/pos/carts').send({}).expect(201);
-    await clerk.agent
-      .post(`/pos/carts/${cart.body.cartId}/items`)
-      .send({ sku: 'MISSING-SKU', quantity: 1 })
-      .expect(404);
-
-    await clerk.agent
-      .post(`/pos/carts/${cart.body.cartId}/items`)
-      .send({ sku: 'SKU-BKMK-01', quantity: 2 })
-      .expect(201);
-
-    const review = await clerk.agent
-      .post(`/pos/carts/${cart.body.cartId}/review-total`)
-      .send({})
-      .expect(201);
-    expect(review.body.reviewReady).toBe(true);
-    expect(review.body.total).toBeGreaterThan(0);
-
-    const bundleCart = await clerk.agent.post('/pos/carts').send({}).expect(201);
-    await clerk.agent
-      .post(`/pos/carts/${bundleCart.body.cartId}/items`)
-      .send({ sku: 'SKU-QH-PRINT', quantity: 1 })
-      .expect(201);
-    await clerk.agent
-      .post(`/pos/carts/${bundleCart.body.cartId}/items`)
-      .send({ sku: 'SKU-BKMK-01', quantity: 1 })
-      .expect(201);
-    const bundleReview = await clerk.agent
-      .post(`/pos/carts/${bundleCart.body.cartId}/review-total`)
-      .send({})
-      .expect(201);
-    expect(bundleReview.body.discount).toBe(3);
-
-    const checkout = await clerk.agent
-      .post(`/pos/carts/${cart.body.cartId}/checkout`)
-      .send({ paymentMethod: 'CASH', paymentNote: 'Till 1 cash drop' })
-      .expect(201);
-    expect(checkout.body.orderId).toBeTruthy();
-
-    const order = await pool.query<{ total_cents: number; payment_note_cipher: string }>(
-      'SELECT total_cents, payment_note_cipher FROM orders WHERE id = $1',
-      [checkout.body.orderId],
-    );
-    expect(order.rows[0]!.total_cents / 100).toBe(review.body.total);
-    expect(order.rows[0]!.payment_note_cipher).not.toBe('Till 1 cash drop');
-    expect(decryptAtRest(order.rows[0]!.payment_note_cipher)).toBe('Till 1 cash drop');
-
-    const priceShiftCart = await clerk.agent.post('/pos/carts').send({}).expect(201);
-    await clerk.agent
-      .post(`/pos/carts/${priceShiftCart.body.cartId}/items`)
-      .send({ sku: 'SKU-QH-PRINT', quantity: 1 })
-      .expect(201);
-    await clerk.agent
-      .post(`/pos/carts/${priceShiftCart.body.cartId}/review-total`)
-      .send({})
-      .expect(201);
-
-    const inventoryBeforeTamper = await pool.query<{ on_hand: number; price_cents: number }>(
-      "SELECT on_hand, price_cents FROM inventory_items WHERE sku = 'SKU-QH-PRINT'",
-    );
-    await pool.query(
-      "UPDATE inventory_items SET price_cents = price_cents + 100 WHERE sku = 'SKU-QH-PRINT'",
-    );
-
-    await clerk.agent
-      .post(`/pos/carts/${priceShiftCart.body.cartId}/checkout`)
-      .send({ paymentMethod: 'CASH', paymentNote: 'stale review test' })
-      .expect(409);
-
-    const orderCount = await pool.query<{ count: string }>(
-      'SELECT COUNT(*)::text AS count FROM orders WHERE cart_id = $1',
-      [priceShiftCart.body.cartId],
-    );
-    expect(Number(orderCount.rows[0]!.count)).toBe(0);
-
-    await pool.query(
-      "UPDATE inventory_items SET price_cents = $2, on_hand = $3 WHERE sku = $1",
-      [
-        'SKU-QH-PRINT',
-        inventoryBeforeTamper.rows[0]!.price_cents,
-        inventoryBeforeTamper.rows[0]!.on_hand,
-      ],
-    );
-
-    await clerk.agent
-      .post('/attendance/clock-in')
-      .field('occurredAt', new Date().toISOString())
-      .field('expectedChecksum', 'missing-file')
-      .expect(400);
-
-    await clerk.agent
-      .post('/attendance/clock-in')
-      .field('occurredAt', new Date().toISOString())
-      .attach('evidence', Buffer.from('not-an-image'), {
-        filename: 'bad.txt',
-        contentType: 'text/plain',
-      })
-      .expect(400);
-
-    await clerk.agent
-      .post('/attendance/clock-in')
-      .field('occurredAt', new Date(Date.now() - 13 * 60 * 60 * 1000).toISOString())
-      .field('expectedChecksum', 'expected-but-wrong')
-      .attach('evidence', Buffer.from('png-like-binary'), { filename: 'proof.png', contentType: 'image/png' })
-      .expect(400);
-
-    await clerk.agent
-      .post('/attendance/clock-in')
-      .field('occurredAt', new Date(Date.now() - 13 * 60 * 60 * 1000).toISOString())
-      .field('expectedChecksum', 'expected-but-wrong')
-      .attach('evidence', VALID_PNG, {
-        filename: '../../../proof.png',
-        contentType: 'image/png',
-      })
-      .expect(201);
-
-    const latestEvidence = await pool.query<{ evidence_path: string }>(
-      `
-      SELECT evidence_path
-      FROM attendance_records
-      WHERE evidence_path IS NOT NULL
-      ORDER BY created_at DESC
-      LIMIT 1
-      `,
-    );
-    expect(latestEvidence.rows[0]!.evidence_path.startsWith('/tmp/ledgerread-evidence')).toBe(true);
-    expect(latestEvidence.rows[0]!.evidence_path.includes('..')).toBe(false);
-
-    const risks = await clerk.agent.get('/attendance/risks').expect(200);
-    expect(
-      risks.body.some((risk: { description: string }) => risk.description.includes('Missing clock-out')),
-    ).toBe(true);
-    expect(
-      risks.body.some((risk: { description: string }) => risk.description.includes('checksum mismatch')),
-    ).toBe(true);
-
-    await clerk.agent
-      .post('/attendance/clock-out')
-      .field('occurredAt', new Date().toISOString())
-      .expect(201);
-
-    await clerk.agent.post('/auth/logout').expect(201);
-  });
-
-  it('prevents one clerk from modifying, reviewing, or checking out another clerk’s cart', async () => {
-    const ownerClerk = await login('clerk.emma', 'Clerk!2026', 'pos');
-    const otherClerk = await login('clerk.oliver', 'ClerkTwo!2026', 'pos');
-
-    const cart = await ownerClerk.agent.post('/pos/carts').send({}).expect(201);
-    const line = await ownerClerk.agent
-      .post(`/pos/carts/${cart.body.cartId}/items`)
-      .send({ sku: 'SKU-BKMK-01', quantity: 1 })
-      .expect(201);
-    const cartItemId = line.body.items[0].cartItemId;
-
-    await otherClerk.agent
-      .patch(`/pos/carts/${cart.body.cartId}/items/${cartItemId}`)
-      .send({ quantity: 2 })
-      .expect(404);
-
-    await otherClerk.agent
-      .post(`/pos/carts/${cart.body.cartId}/review-total`)
-      .send({})
-      .expect(404);
-
-    await otherClerk.agent
-      .post(`/pos/carts/${cart.body.cartId}/checkout`)
-      .send({ paymentMethod: 'CASH', paymentNote: 'Not your cart' })
-      .expect(404);
-
-    await ownerClerk.agent.post('/auth/logout').expect(201);
-    await otherClerk.agent.post('/auth/logout').expect(201);
-  });
-
-  it('serializes concurrent attendance writes into a linear hash chain', async () => {
-    const clerk = await login('clerk.emma', 'Clerk!2026', 'pos');
-    const baseTime = Date.now();
-
-    const [clockIn, clockOut] = await Promise.all([
-      clerk.agent
-        .post('/attendance/clock-in')
-        .field('occurredAt', new Date(baseTime - 1000).toISOString()),
-      clerk.agent
-        .post('/attendance/clock-out')
-        .field('occurredAt', new Date(baseTime).toISOString()),
-    ]);
-
-    expect(clockIn.status).toBe(201);
-    expect(clockOut.status).toBe(201);
-
-    const attendanceChain = await pool.query<{
-      previous_hash: string | null;
-      current_hash: string;
-    }>(
-      `
-      SELECT previous_hash, current_hash
-      FROM attendance_records
-      ORDER BY created_at ASC
-      `,
-    );
-
-    expect(attendanceChain.rows.length).toBeGreaterThanOrEqual(2);
-    for (let index = 1; index < attendanceChain.rows.length; index += 1) {
-      expect(attendanceChain.rows[index]!.previous_hash).toBe(
-        attendanceChain.rows[index - 1]!.current_hash,
-      );
-    }
-
-    await clerk.agent.post('/auth/logout').expect(201);
-  });
-
-  it('runs moderator and admin flows with transactional reconciliation and moving-average valuation', async () => {
-    const title = await pool.query<{ id: string }>(
-      "SELECT id FROM titles WHERE slug = 'quiet-harbor-digital'",
-    );
-    const restorableBody = `Restorable thread ${Date.now()}`;
-    const suspendableBody = `Suspend target ${Date.now()}`;
-
-    const ada = await login('reader.ada', 'Reader!2026', 'app');
-    const mei = await login('reader.mei', 'Reader!2026', 'app');
-
-    await pool.query(
-      `
-      UPDATE comments
-      SET created_at = NOW() - INTERVAL '2 minutes'
-      WHERE user_id IN ($1, $2)
-      `,
-      [ada.user.id, mei.user.id],
-    );
-
-    await mei.agent
-      .post('/community/comments')
-      .send({
-        titleId: title.rows[0]!.id,
-        commentType: 'COMMENT',
-        body: restorableBody,
-      })
-      .expect(201);
-
-    const restorableComment = await pool.query<{ id: string }>(
-      'SELECT id FROM comments WHERE body = $1 ORDER BY created_at DESC LIMIT 1',
-      [restorableBody],
-    );
-
-    await ada.agent
-      .post('/community/reports')
-      .send({
-        commentId: restorableComment.rows[0]!.id,
-        category: 'ABUSE',
-        notes: 'restore-path coverage',
-      })
-      .expect(201);
-
-    await ada.agent
-      .post('/community/comments')
-      .send({
-        titleId: title.rows[0]!.id,
-        commentType: 'COMMENT',
-        body: suspendableBody,
-      })
-      .expect(201);
-
-    const suspendableComment = await pool.query<{ id: string }>(
-      'SELECT id FROM comments WHERE body = $1 ORDER BY created_at DESC LIMIT 1',
-      [suspendableBody],
-    );
-
-    await mei.agent
-      .post('/community/reports')
-      .send({
-        commentId: suspendableComment.rows[0]!.id,
-        category: 'ABUSE',
-        notes: 'suspend-path coverage',
-      })
-      .expect(201);
-
-    await ada.agent.post('/auth/logout').expect(201);
-    await mei.agent.post('/auth/logout').expect(201);
-
-    const moderator = await login('mod.noah', 'Moderator!2026', 'mod');
-    const openQueue = await moderator.agent.get('/moderation/queue').expect(200);
-    expect(openQueue.body.length).toBeGreaterThan(0);
-
-    const restoreCandidate = openQueue.body.find(
-      (item: { comment_id: string | null }) => item.comment_id === restorableComment.rows[0]!.id,
-    );
-    const suspendCandidate = openQueue.body.find(
-      (item: { comment_id: string | null }) => item.comment_id === suspendableComment.rows[0]!.id,
-    );
-    expect(restoreCandidate).toBeTruthy();
-    expect(suspendCandidate).toBeTruthy();
-
-    await moderator.agent
-      .post('/moderation/actions')
-      .send({
-        reportId: restoreCandidate.id,
-        targetCommentId: restoreCandidate.comment_id,
-        action: 'hide',
-        notes: 'Reviewer moderation coverage',
-      })
-      .expect(201);
-
-    const resolvedQueue = await moderator.agent
-      .get('/moderation/queue?status=RESOLVED')
-      .expect(200);
-    const resolvedRestoreCandidate = resolvedQueue.body.find(
-      (item: { comment_id: string | null }) => item.comment_id === restorableComment.rows[0]!.id,
-    );
-    expect(resolvedRestoreCandidate?.comment_hidden).toBe(true);
-
-    await moderator.agent
-      .post('/moderation/actions')
-      .send({
-        reportId: resolvedRestoreCandidate.id,
-        targetCommentId: resolvedRestoreCandidate.comment_id,
-        action: 'restore',
-        notes: 'Reviewer restore coverage',
-      })
-      .expect(201);
-
-    await moderator.agent
-      .post('/moderation/actions')
-      .send({
-        reportId: suspendCandidate.id,
-        targetCommentId: suspendCandidate.comment_id,
-        targetUserId: await findUserId('reader.mei'),
-        action: 'suspend',
-        notes: 'override rejection coverage',
-      })
-      .expect(409);
-
-    await moderator.agent
-      .post('/moderation/actions')
-      .send({
-        reportId: suspendCandidate.id,
-        targetCommentId: suspendCandidate.comment_id,
-        action: 'suspend',
-        notes: 'Reviewer suspend coverage',
-      })
-      .expect(201);
-
-    const restoreActions = await pool.query<{ count: string }>(
-      `
-      SELECT COUNT(*)::text AS count
-      FROM moderation_actions
-      WHERE target_comment_id = $1
-        AND action IN ('hide', 'restore')
-      `,
-      [restorableComment.rows[0]!.id],
-    );
-    expect(Number(restoreActions.rows[0]!.count)).toBe(2);
-
-    await moderator.agent.post('/auth/logout').expect(201);
-
-    await agent
-      .post('/auth/login')
-      .send({ username: 'reader.ada', password: 'Reader!2026', workspace: 'app' })
-      .expect(403);
-
-    const restoredViewer = await login('reader.mei', 'Reader!2026', 'app');
-    const restoredThread = await graphql<{
-      communityThread: {
-        comments: Array<{ id: string; visibleBody: string }>;
-      };
-    }>(
-      restoredViewer.agent,
-      `
-        query ($titleId: String!) {
-          communityThread(titleId: $titleId) {
-            comments {
-              id
-              visibleBody
-            }
-          }
-        }
-      `,
-      { titleId: title.rows[0]!.id },
-    );
-    expect(
-      restoredThread.communityThread.comments.find(
-        (comment) => comment.id === restorableComment.rows[0]!.id,
-      )?.visibleBody,
-    ).toBe(restorableBody);
-    await restoredViewer.agent.post('/auth/logout').expect(201);
-
-    const admin = await login('manager.li', 'Manager!2026', 'admin');
-    const valuationBefore = await pool.query<{ on_hand: number; moving_average_cost_cents: number }>(
-      "SELECT on_hand, moving_average_cost_cents FROM inventory_items WHERE sku = 'SKU-QH-PRINT'",
-    );
-
-    const importResponse = await admin.agent
-      .post('/admin/manifests/import')
-      .send({
-        supplierName: 'North Pier Press',
-        sourceFilename: 'import-review.json',
-        statementReference: 'STMT-2026-03-28-A',
-        invoiceReference: 'INV-2026-03-28-A',
-        freightCents: 800,
-        surchargeCents: 200,
-        paymentPlanStatus: 'DISPUTED',
-        items: [
-          {
-            sku: 'SKU-QH-PRINT',
-            statementQuantity: 10,
-            invoiceQuantity: 8,
-            statementExtendedAmountCents: 10000,
-            invoiceExtendedAmountCents: 9600,
-          },
-        ],
-      })
-      .expect(201);
-    expect(importResponse.body.discrepancyCount).toBe(1);
-
-    const importedPlan = await pool.query<{ note_cipher: string }>(
-      `
-      SELECT note_cipher
-      FROM payment_plans
-      WHERE supplier_statement_id = $1
-      LIMIT 1
-      `,
-      [importResponse.body.statementId],
-    );
-    const expectedImportedPlanNote =
-      'Statement STMT-2026-03-28-A matched to invoice INV-2026-03-28-A. Freight 800 cents, surcharge 200 cents.';
-    expect(importedPlan.rows[0]!.note_cipher).not.toBe(expectedImportedPlanNote);
-    expect(decryptAtRest(importedPlan.rows[0]!.note_cipher)).toBe(expectedImportedPlanNote);
-
-    const valuationAfter = await pool.query<{ on_hand: number; moving_average_cost_cents: number }>(
-      "SELECT on_hand, moving_average_cost_cents FROM inventory_items WHERE sku = 'SKU-QH-PRINT'",
-    );
-    const expectedMovingAverage = Math.round(
-      (valuationBefore.rows[0]!.on_hand * valuationBefore.rows[0]!.moving_average_cost_cents + 9600 + 1000) /
-        (valuationBefore.rows[0]!.on_hand + 8),
-    );
-    expect(valuationAfter.rows[0]!.on_hand).toBe(valuationBefore.rows[0]!.on_hand + 8);
-    expect(valuationAfter.rows[0]!.moving_average_cost_cents).toBe(expectedMovingAverage);
-
-    const pendingSettlements = await admin.agent
-      .get('/admin/settlements?status=DISPUTED')
-      .expect(200);
-    expect(
-      pendingSettlements.body.paymentPlans.some(
-        (plan: { invoice_reference: string; statement_reference: string; landedCost: number }) =>
-          plan.invoice_reference === 'INV-2026-03-28-A' &&
-          plan.statement_reference === 'STMT-2026-03-28-A' &&
-          plan.landedCost === 10,
-      ),
-    ).toBe(true);
-    expect(
-      pendingSettlements.body.discrepancies.some(
-        (item: { sku: string; quantity_difference: number; amountDifference: number }) =>
-          item.sku === 'SKU-QH-PRINT' &&
-          item.quantity_difference === 2 &&
-          item.amountDifference === 4,
-      ),
-    ).toBe(true);
-
-    const rollbackBefore = await pool.query<{ on_hand: number; moving_average_cost_cents: number }>(
-      "SELECT on_hand, moving_average_cost_cents FROM inventory_items WHERE sku = 'SKU-BKMK-01'",
-    );
-    await admin.agent
-      .post('/admin/manifests/import')
-      .send({
-        supplierName: 'Rollback Press',
-        sourceFilename: 'rollback.json',
-        statementReference: 'STMT-ROLLBACK-1',
-        invoiceReference: 'INV-ROLLBACK-1',
-        freightCents: 300,
-        surchargeCents: 100,
-        paymentPlanStatus: 'PENDING',
-        items: [
-          {
-            sku: 'SKU-BKMK-01',
-            statementQuantity: 5,
-            invoiceQuantity: 5,
-            statementExtendedAmountCents: 1500,
-            invoiceExtendedAmountCents: 1450,
-          },
-          {
-            sku: 'SKU-UNKNOWN',
-            statementQuantity: 2,
-            invoiceQuantity: 2,
-            statementExtendedAmountCents: 400,
-            invoiceExtendedAmountCents: 400,
-          },
-        ],
-      })
-      .expect(404);
-
-    const rollbackStatementCount = await pool.query<{ count: string }>(
-      `
-      SELECT COUNT(*)::text AS count
-      FROM supplier_statements
-      WHERE statement_reference = 'STMT-ROLLBACK-1'
-      `,
-    );
-    const rollbackInvoiceCount = await pool.query<{ count: string }>(
-      `
-      SELECT COUNT(*)::text AS count
-      FROM supplier_invoices
-      WHERE invoice_reference = 'INV-ROLLBACK-1'
-      `,
-    );
-    const rollbackInventoryAfter = await pool.query<{ on_hand: number; moving_average_cost_cents: number }>(
-      "SELECT on_hand, moving_average_cost_cents FROM inventory_items WHERE sku = 'SKU-BKMK-01'",
-    );
-    expect(Number(rollbackStatementCount.rows[0]!.count)).toBe(0);
-    expect(Number(rollbackInvoiceCount.rows[0]!.count)).toBe(0);
-    expect(rollbackInventoryAfter.rows[0]!.on_hand).toBe(rollbackBefore.rows[0]!.on_hand);
-    expect(rollbackInventoryAfter.rows[0]!.moving_average_cost_cents).toBe(
-      rollbackBefore.rows[0]!.moving_average_cost_cents,
-    );
-
-    const pagedAudit = await admin.agent
-      .get('/admin/audit-logs?limit=2&action=CHECKOUT_COMPLETED')
-      .expect(200);
-    expect(pagedAudit.body.length).toBeLessThanOrEqual(2);
-    expect(pagedAudit.body.every((item: { action: string }) => item.action === 'CHECKOUT_COMPLETED')).toBe(true);
-
-    await admin.agent.post('/auth/logout').expect(201);
   });
 });

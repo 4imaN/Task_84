@@ -8,6 +8,7 @@
     "start": "node dist/main.js",
     "migrate": "tsx src/scripts/migrate.ts",
     "seed": "tsx src/scripts/seed.ts",
+    "seed:reset": "LEDGERREAD_SEED_RESET=1 tsx src/scripts/seed.ts",
     "test": "jest --runInBand --coverage"
   },
   "dependencies": {
@@ -27,7 +28,7 @@
     "class-validator": "^0.14.1",
     "csv-parse": "^5.6.0",
     "graphql": "^16.10.0",
-    "multer": "^1.4.5-lts.2",
+    "multer": "^2.1.1",
     "pg": "^8.13.1",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1"
@@ -36,7 +37,7 @@
     "@nestjs/testing": "^11.0.7",
     "@types/express": "^5.0.0",
     "@types/jest": "^29.5.14",
-    "@types/multer": "^1.4.12",
+    "@types/multer": "^2.1.0",
     "@types/node": "^22.10.2",
     "@types/pg": "^8.20.0",
     "@types/supertest": "^6.0.2",

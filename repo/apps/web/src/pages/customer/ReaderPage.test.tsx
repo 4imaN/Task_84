@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -68,6 +68,7 @@ describe('ReaderPage', () => {
         slug: 'quiet-harbor-digital',
         name: 'Quiet Harbor',
         format: 'DIGITAL',
+        isReadable: true,
         price: 12.99,
         inventoryOnHand: 999,
         authorName: 'Lian Sun',
@@ -120,6 +121,55 @@ describe('ReaderPage', () => {
     });
   });
 
+  it('renders reader typography in pt and persists the same numeric font size through profile updates', async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: {
+          retry: false,
+        },
+      },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <StatefulContext>
+          <MemoryRouter initialEntries={['/app/reader/title-1']}>
+            <Routes>
+              <Route path="/app/reader/:titleId" element={<ReaderPage />} />
+            </Routes>
+          </MemoryRouter>
+        </StatefulContext>
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('简体正文')).toBeInTheDocument();
+    });
+
+    const readingSurface = screen.getByTestId('reader-content-surface');
+    expect(readingSurface).toHaveStyle({ fontSize: '18pt' });
+
+    const fontSizeSlider = screen.getByRole('slider', { name: /font size/i });
+    fireEvent.change(fontSizeSlider, { target: { value: '22' } });
+
+    await waitFor(() => {
+      expect(readingSurface).toHaveStyle({ fontSize: '22pt' });
+    });
+
+    await userEvent.click(screen.getByRole('button', { name: 'Save Preferences' }));
+
+    await waitFor(() => {
+      expect(apiRequest).toHaveBeenCalledWith(
+        '/profiles/me',
+        expect.objectContaining({
+          method: 'PUT',
+          body: expect.stringContaining('"fontSize":22'),
+        }),
+        expect.anything(),
+      );
+    });
+  });
+
   it('renders a retryable error state when the title fetch fails and no encrypted cache exists', async () => {
     vi.mocked(graphQLRequest).mockRejectedValue(new Error('The title service is unavailable.'));
     vi.mocked(loadCachedTitle).mockResolvedValue(null);
@@ -157,6 +207,7 @@ describe('ReaderPage', () => {
       slug: 'quiet-harbor-digital',
       name: 'Quiet Harbor',
       format: 'DIGITAL',
+      isReadable: true,
       price: 12.99,
       inventoryOnHand: 999,
       authorName: 'Lian Sun',
@@ -199,5 +250,39 @@ describe('ReaderPage', () => {
       expect(screen.getByText('Offline Reading Cache')).toBeInTheDocument();
     });
     expect(screen.getByText('Quiet Harbor')).toBeInTheDocument();
+  });
+
+  it('blocks unreadable titles from entering the reader workspace', async () => {
+    vi.mocked(graphQLRequest).mockRejectedValue(
+      new Error('This title is not available in the reader workspace.'),
+    );
+    vi.mocked(loadCachedTitle).mockResolvedValue(null);
+
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: {
+          retry: false,
+        },
+      },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <StatefulContext>
+          <MemoryRouter initialEntries={['/app/reader/title-physical']}>
+            <Routes>
+              <Route path="/app/reader/:titleId" element={<ReaderPage />} />
+            </Routes>
+          </MemoryRouter>
+        </StatefulContext>
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Title Not Readable')).toBeInTheDocument();
+    });
+    expect(
+      screen.getByText('This product is not available in the reader workspace. Open a digital title from the library instead.'),
+    ).toBeInTheDocument();
   });
 });

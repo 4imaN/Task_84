@@ -4,6 +4,7 @@ import { CommunityService } from './community.service';
 describe('CommunityService', () => {
   const databaseService = {
     query: jest.fn(),
+    withTransaction: jest.fn(),
   };
   const auditService = {
     write: jest.fn(),
@@ -25,12 +26,19 @@ describe('CommunityService', () => {
   });
 
   it('creates a comment and writes the moderation-safe audit payload', async () => {
-    databaseService.query
-      .mockResolvedValueOnce({ rows: [{ id: 'title-1' }] })
-      .mockResolvedValueOnce({ rows: [{ count: '0' }] })
-      .mockResolvedValueOnce({ rows: [] })
-      .mockResolvedValueOnce({ rows: [] })
-      .mockResolvedValueOnce({ rows: [{ id: 'comment-1', created_at: '2026-03-29T12:00:00.000Z' }] });
+    const transactionClient = {
+      query: jest
+        .fn()
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [{ id: 'title-1' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '0' }] })
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [{ id: 'comment-1', created_at: '2026-03-29T12:00:00.000Z' }] }),
+    };
+    databaseService.withTransaction.mockImplementation(
+      async (runner: (client: typeof transactionClient) => Promise<unknown>) => runner(transactionClient),
+    );
 
     const created = await service.createComment(user, 'trace-1', {
       titleId: 'title-1',
@@ -53,17 +61,24 @@ describe('CommunityService', () => {
         parentCommentId: null,
         commentType: 'COMMENT',
       },
-    });
+    }, transactionClient);
   });
 
   it('creates a reply when the parent comment belongs to the same title', async () => {
-    databaseService.query
-      .mockResolvedValueOnce({ rows: [{ id: 'title-1' }] })
-      .mockResolvedValueOnce({ rows: [{ id: 'parent-1', title_id: 'title-1' }] })
-      .mockResolvedValueOnce({ rows: [{ count: '0' }] })
-      .mockResolvedValueOnce({ rows: [] })
-      .mockResolvedValueOnce({ rows: [] })
-      .mockResolvedValueOnce({ rows: [{ id: 'reply-1', created_at: '2026-03-29T12:05:00.000Z' }] });
+    const transactionClient = {
+      query: jest
+        .fn()
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [{ id: 'title-1' }] })
+        .mockResolvedValueOnce({ rows: [{ id: 'parent-1', title_id: 'title-1' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '0' }] })
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [{ id: 'reply-1', created_at: '2026-03-29T12:05:00.000Z' }] }),
+    };
+    databaseService.withTransaction.mockImplementation(
+      async (runner: (client: typeof transactionClient) => Promise<unknown>) => runner(transactionClient),
+    );
 
     const created = await service.createComment(user, 'trace-reply', {
       titleId: 'title-1',
@@ -85,13 +100,21 @@ describe('CommunityService', () => {
           commentType: 'QUESTION',
         }),
       }),
+      transactionClient,
     );
   });
 
   it('rejects replies whose parent comment belongs to another title', async () => {
-    databaseService.query
-      .mockResolvedValueOnce({ rows: [{ id: 'title-1' }] })
-      .mockResolvedValueOnce({ rows: [{ id: 'parent-2', title_id: 'title-2' }] });
+    const transactionClient = {
+      query: jest
+        .fn()
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [{ id: 'title-1' }] })
+        .mockResolvedValueOnce({ rows: [{ id: 'parent-2', title_id: 'title-2' }] }),
+    };
+    databaseService.withTransaction.mockImplementation(
+      async (runner: (client: typeof transactionClient) => Promise<unknown>) => runner(transactionClient),
+    );
 
     await expect(
       service.createComment(user, 'trace-cross-title', {
@@ -105,11 +128,18 @@ describe('CommunityService', () => {
   });
 
   it('rejects comments that contain a sensitive term', async () => {
-    databaseService.query
-      .mockResolvedValueOnce({ rows: [{ id: 'title-1' }] })
-      .mockResolvedValueOnce({ rows: [{ count: '0' }] })
-      .mockResolvedValueOnce({ rows: [] })
-      .mockResolvedValueOnce({ rows: [{ word: 'spoiler' }] });
+    const transactionClient = {
+      query: jest
+        .fn()
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [{ id: 'title-1' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '0' }] })
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [{ word: 'spoiler' }] }),
+    };
+    databaseService.withTransaction.mockImplementation(
+      async (runner: (client: typeof transactionClient) => Promise<unknown>) => runner(transactionClient),
+    );
 
     await expect(
       service.createComment(user, 'trace-2', {
@@ -117,15 +147,24 @@ describe('CommunityService', () => {
         commentType: 'COMMENT',
         body: 'This spoiler should be rejected.',
       }),
-    ).rejects.toBeInstanceOf(ConflictException);
+    ).rejects.toMatchObject({
+      message: 'The comment contains prohibited content.',
+    });
     expect(auditService.write).not.toHaveBeenCalled();
   });
 
   it('rejects duplicate comment content within the 60-second window', async () => {
-    databaseService.query
-      .mockResolvedValueOnce({ rows: [{ id: 'title-1' }] })
-      .mockResolvedValueOnce({ rows: [{ count: '0' }] })
-      .mockResolvedValueOnce({ rows: [{ id: 'duplicate-comment' }] });
+    const transactionClient = {
+      query: jest
+        .fn()
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [{ id: 'title-1' }] })
+        .mockResolvedValueOnce({ rows: [{ count: '0' }] })
+        .mockResolvedValueOnce({ rows: [{ id: 'duplicate-comment' }] }),
+    };
+    databaseService.withTransaction.mockImplementation(
+      async (runner: (client: typeof transactionClient) => Promise<unknown>) => runner(transactionClient),
+    );
 
     await expect(
       service.createComment(user, 'trace-3', {
@@ -159,5 +198,29 @@ describe('CommunityService', () => {
         category: 'ABUSE',
       },
     });
+  });
+
+  it('rejects self-target mute relationships', async () => {
+    await expect(
+      service.updateMute(user, 'trace-self-mute', {
+        targetUserId: user.id,
+        active: true,
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+
+    expect(databaseService.query).not.toHaveBeenCalled();
+    expect(auditService.write).not.toHaveBeenCalled();
+  });
+
+  it('rejects self-target block relationships', async () => {
+    await expect(
+      service.updateBlock(user, 'trace-self-block', {
+        targetUserId: user.id,
+        active: true,
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+
+    expect(databaseService.query).not.toHaveBeenCalled();
+    expect(auditService.write).not.toHaveBeenCalled();
   });
 });
