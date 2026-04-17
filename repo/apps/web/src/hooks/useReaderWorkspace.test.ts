@@ -4,7 +4,8 @@ import { getChapterBody, getReaderSurfaceClass, getReaderFontFamily } from './us
 describe('getChapterBody', () => {
   const chapter = {
     id: 'ch-1',
-    title: 'Chapter 1',
+    order: 1,
+    name: 'Chapter 1',
     body: 'Default body text',
     bodyTraditional: '傳統中文',
     bodySimplified: '简体中文',

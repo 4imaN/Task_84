@@ -107,7 +107,7 @@ describe('useFinanceWorkspace', () => {
         result.current.addManifestRow();
       });
       expect(result.current.items).toHaveLength(initialLength + 1);
-      expect(result.current.items[result.current.items.length - 1].sku).toBe('');
+      expect(result.current.items.at(-1)!.sku).toBe('');
 
       act(() => {
         result.current.removeManifestRow(result.current.items.length - 1);
@@ -127,12 +127,12 @@ describe('useFinanceWorkspace', () => {
       act(() => {
         result.current.updateManifestItem(0, 'sku', 'sku-new-print');
       });
-      expect(result.current.items[0].sku).toBe('SKU-NEW-PRINT');
+      expect(result.current.items.at(0)!.sku).toBe('SKU-NEW-PRINT');
 
       act(() => {
         result.current.updateManifestItem(0, 'statementQuantity', '99');
       });
-      expect(result.current.items[0].statementQuantity).toBe(99);
+      expect(result.current.items.at(0)!.statementQuantity).toBe(99);
     });
   });
 
@@ -194,12 +194,6 @@ describe('useFinanceWorkspace', () => {
 
   describe('audit path', () => {
     it('returns /finance/audits for finance workspace', async () => {
-      vi.mocked(useAppContext).mockReturnValue({
-        session: { ...makeSession('FINANCE', 'finance'), homePath: '/finance/settlements' },
-        addToast: vi.fn(),
-      } as any);
-
-      // Need to change the session.user.workspace
       vi.mocked(useAppContext).mockReturnValue({
         session: {
           user: { id: 'u-1', username: 'finance.zoe', role: 'FINANCE', workspace: 'finance' },
