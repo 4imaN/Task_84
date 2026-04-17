@@ -15,14 +15,13 @@ Modes:
   api-local  Run API tests against an existing local PostgreSQL instance
   web        Run web unit/component tests in Docker/Node 20
   e2e        Build/start docker stack and run Playwright E2E tests
-  full       Run all + e2e (default)
+  full       Run all + e2e (requires host-side Node.js and Playwright)
   help       Show this help
 
 Examples:
   ./run_tests.sh
   ./run_tests.sh api
-  ./run_tests.sh e2e
-  ./run_tests.sh full
+  ./run_tests.sh web
 EOF
 }
 
@@ -85,7 +84,7 @@ run_e2e() {
   npm run test:web:e2e
 }
 
-MODE="${1:-full}"
+MODE="${1:-all}"
 
 case "$MODE" in
   all)

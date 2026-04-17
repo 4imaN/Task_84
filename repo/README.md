@@ -1,152 +1,89 @@
 # LedgerRead Commerce & Compliance
 
+**Project type: fullstack**
+
 LedgerRead is an offline-first publishing retail platform built as a containerized monorepo. It combines a reader-focused customer workspace, a moderated community layer, an in-store POS flow, and a governance-heavy admin console backed by NestJS, React, and PostgreSQL.
 
-## Startup Options
-
-### Official Reviewer Startup (Docker)
+## Startup
 
 ```bash
-docker compose up --build
+docker-compose up
 ```
 
-This is the zero-manual-setup path used for delivery review and the one-command requirement.
+This is the zero-manual-setup path. Everything—PostgreSQL, migrations, seeding, the API, and the built frontend—runs inside Docker with no host-side installs required.
+
+`docker compose up --build` also works and forces a fresh image rebuild if the Dockerfile or source has changed since the last build.
+
 The unified app container generates a runtime `APP_ENCRYPTION_KEY` once and persists it in `.ledgerread-runtime/app_encryption_key` when one is not supplied, so the application keeps a stable local key across restarts without relying on a checked-in demo secret.
 
-Endpoints:
+Endpoints after startup:
 
 - Unified app UI + REST API: [http://localhost:4000](http://localhost:4000)
 - GraphQL API endpoint: [http://localhost:4000/graphql](http://localhost:4000/graphql)
   - Playground and introspection stay disabled outside development.
 
-For local-network access on another machine, open `http://<host-or-lan-ip>:4000` from that client.  
+For local-network access on another machine, open `http://<host-or-lan-ip>:4000` from that client.
 Same-host LAN browser origins are accepted automatically by both bootstrap CORS and CSRF origin checks, and extra cross-origin browser origins can be allowlisted through `APP_ALLOWED_ORIGINS`.
 
-### Local Development Startup
+## How to Verify
 
-LedgerRead also supports a local development flow without the full Docker app wrapper.
-You can run PostgreSQL either through Docker or from an existing local install.
+After `docker-compose up` completes and the `ledgerread-app` container is healthy:
 
-```bash
-npm install
-export APP_ENCRYPTION_KEY=$(openssl rand -hex 32)
-docker compose up -d postgres
-export DATABASE_ADMIN_URL=postgresql://postgres:postgres@localhost:5432/ledgerread
-export DATABASE_URL=postgresql://ledgerread_app:ledgerread_app@localhost:5432/ledgerread
-npm run build:shared
-npm run migrate -w @ledgerread/api
-npm run seed -w @ledgerread/api
-npm run dev:api
-```
+### Browser verification (UI)
 
-In a second terminal:
+1. Open [http://localhost:4000/login](http://localhost:4000/login)
+2. Log in as Customer: username `reader.ada`, password `Reader!2026`
+3. You should see the library page with catalog titles. Click a digital title to open the reader.
+4. Log out, then open [http://localhost:4000/admin/login](http://localhost:4000/admin/login)
+5. Log in as Manager: username `manager.li`, password `Manager!2026`
+6. Navigate to Finance and Audit pages to confirm data loads.
+
+### API verification (curl)
+
+Health-check the session endpoint (should return 401 when unauthenticated):
 
 ```bash
-npm run dev:web
+curl -s -o /dev/null -w "%{http_code}" http://localhost:4000/auth/session
+# Expected: 401
 ```
 
-By default:
-
-- the API runtime expects `DATABASE_URL=postgresql://ledgerread_app:ledgerread_app@localhost:5432/ledgerread`
-- migrations/seed/reset workflows use `DATABASE_ADMIN_URL` (or `DATABASE_URL` when `DATABASE_ADMIN_URL` is unset)
-- the Vite client proxies API traffic to `http://localhost:4000`
-- browser origin allowlisting uses `APP_BASE_URL` plus local dev defaults, with optional comma-separated extras from `APP_ALLOWED_ORIGINS`
-- forwarded-host trust is disabled by default; set `APP_TRUSTED_PROXY_HOPS` (for example `1`) only when running behind a trusted reverse proxy path
-- runtime startup rejects `DATABASE_URL` values that use the `postgres` superuser unless `LEDGERREAD_ALLOW_SUPERUSER_RUNTIME=1` is set explicitly in non-production local development
-
-If you already have PostgreSQL running outside Docker, point both `DATABASE_ADMIN_URL` and `DATABASE_URL` at that instance using the appropriate admin/app-role credentials.
-Set `APP_ENCRYPTION_KEY` before running `migrate`, `seed`, or `dev:api`; local backend startup does not rely on a checked-in secret.
-`npm run seed -w @ledgerread/api` is restart-safe: once data exists it exits without rewriting historical governance records.
-For an explicit local reset/reseed workflow, run:
+Verify the audit integrity chain:
 
 ```bash
-npm run seed:reset -w @ledgerread/api
+curl -s -o /dev/null -w "%{http_code}" http://localhost:4000/admin/audit-integrity
+# Expected: 401 (requires authenticated session with MANAGER role)
 ```
 
-Destructive reseed is blocked when `NODE_ENV=production` unless `LEDGERREAD_ALLOW_DESTRUCTIVE_SEED_IN_PRODUCTION=1` is also set intentionally.
-If baseline seed artifacts are partially present (for example an interrupted first seed), startup seeding now fails fast with a `Partial seed initialization detected` error instead of silently skipping.
-
-## Seeded Accounts
+### Seeded Accounts
 
 The startup path runs migrations and then invokes the seed script. Seeding is non-destructive by default (it skips initialized databases), so normal restarts preserve immutable governance history.
 Passwords are never echoed by the test runner.
 
-Reviewer accounts:
+| Role | Username | Password | Login URL |
+|------|----------|----------|-----------|
+| Customer | `reader.ada` | `Reader!2026` | `/login` |
+| Customer | `reader.mei` | `Reader!2026` | `/login` |
+| Clerk | `clerk.emma` | `Clerk!2026` | `/pos/login` |
+| Moderator | `mod.noah` | `Moderator!2026` | `/mod/login` |
+| Manager | `manager.li` | `Manager!2026` | `/admin/login` |
+| Finance | `finance.zoe` | `Finance!2026` | `/finance/login` |
+| Inventory | `inventory.ivan` | `Inventory!2026` | `/admin/login` |
 
-- Customer: `reader.ada` / `Reader!2026`
-- Customer: `reader.mei` / `Reader!2026`
-- Clerk: `clerk.emma` / `Clerk!2026`
-- Moderator: `mod.noah` / `Moderator!2026`
-- Manager: `manager.li` / `Manager!2026`
-- Finance: `finance.zoe` / `Finance!2026`
-- Inventory: `inventory.ivan` / `Inventory!2026`
+## Running Tests
 
-Login entry points:
-
-- Customer: `/login`
-- Clerk: `/pos/login`
-- Moderator: `/mod/login`
-- Manager / Inventory: `/admin/login`
-- Finance: `/finance/login`
-
-## Backend Verification (Docker Required)
+API and web unit/component test suites run entirely inside Docker containers via `run_tests.sh`. No host-side `npm install`, Node.js, or PostgreSQL is required.
 
 ```bash
-npm install
-npm run test:api
+./run_tests.sh        # API + web tests (Docker, default)
+./run_tests.sh api    # API unit + e2e tests (Docker)
+./run_tests.sh web    # Web unit/component tests (Docker)
 ```
 
-`npm run test:api` starts the PostgreSQL test dependency through Docker Compose before resetting the test schema, migrating, seeding, and running the NestJS suite.
-The wrapper also reuses the shared runtime key file automatically when `APP_ENCRYPTION_KEY` is not set, so backend verification does not depend on a handwritten `.env`.
+The `api` mode builds the app image, starts a PostgreSQL container, and runs the NestJS suite inside a `docker compose run` container with test-scoped env vars. No host-side database or `npm install` is needed.
+The `web` mode runs Vitest inside the same app container.
+The default (`all`) runs both in sequence.
+The wrapper reuses the shared runtime key file at `.ledgerread-runtime/app_encryption_key` automatically so backend verification does not depend on a handwritten `.env`.
 The API e2e coverage is split by domain under `apps/api/test/` (`app.e2e.spec.ts`, `app.community-pos.e2e.spec.ts`, `app.governance.e2e.spec.ts`) to keep ownership boundaries and regressions easier to trace.
-
-## Frontend Verification
-
-Standalone compile verification:
-
-```bash
-npm install
-npm run build:web
-npm run test:web
-```
-
-Browser-level end-to-end verification against the running Docker stack:
-
-```bash
-npx playwright install chromium
-npm run test:web:e2e
-```
-
-Interactive frontend development:
-
-```bash
-docker compose up --build
-npm run dev:web
-```
-
-The interactive web client proxies API traffic to `http://localhost:4000` by default.
-Set `VITE_DEV_API_TARGET` if the API should resolve somewhere else on your local network.
-
-## Optional Advanced Local Backend Verification (No Docker Wrapper)
-
-Requires a manually running PostgreSQL instance reachable at `DATABASE_URL` or the default local Postgres URL used by the scripts.
-
-```bash
-npm install
-export APP_ENCRYPTION_KEY=$(openssl rand -hex 32)
-npm run test:api:local
-```
-
-## Local Backend Smoke (Existing Postgres, No Docker Wrapper)
-
-This smoke path is intended for environments where PostgreSQL already exists locally and you want a quick backend confidence check without the Docker app wrapper.
-It resets the configured database schema before running `migrate` and `seed`, so point `DATABASE_URL` at a disposable local development database.
-
-```bash
-npm install
-export APP_ENCRYPTION_KEY=$(openssl rand -hex 32)
-npm run smoke:api:local
-```
 
 ## Workspace Layout
 
